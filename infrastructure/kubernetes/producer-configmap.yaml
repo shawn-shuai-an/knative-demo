@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: producer-config
+  namespace: knative-demo
+data:
+  requirements.txt: |
+    requests==2.31.0
+    cloudevents==1.10.1
+  
+  producer.py: |
+    #!/usr/bin/env python3
+    """
+    简化版事件生产者 - 定时发送事件到 Knative Broker
+    """
+    
+    import os
+    import time
+    import uuid
+    import json
+    import logging
+    from datetime import datetime
+    from typing import Dict, Any
+    
+    import requests
+    from cloudevents.http import CloudEvent, to_structured
+    
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    class SimpleEventProducer:
+        def __init__(self):
+            self.broker_url = os.getenv('BROKER_URL', 
+                'http://broker-ingress.knative-eventing.svc.cluster.local/knative-demo/default')
+            self.source = os.getenv('SOURCE', 'knative-demo-producer')
+            self.interval = int(os.getenv('SEND_INTERVAL', '10'))  # 发送间隔(秒)
+            self.event_counter = 0
+            
+            logger.info(f"Producer initialized:")
+            logger.info(f"  Broker URL: {self.broker_url}")
+            logger.info(f"  Source: {self.source}")
+            logger.info(f"  Send Interval: {self.interval} seconds")
+    
+        def create_event(self, event_type: str, data: Dict[str, Any]) -> CloudEvent:
+            """创建 CloudEvent"""
+            self.event_counter += 1
+            
+            attributes = {
+                "type": event_type,
+                "source": self.source,
+                "id": str(uuid.uuid4()),
+                "time": datetime.utcnow().isoformat() + "Z",
+                "datacontenttype": "application/json"
+            }
+            
+            return CloudEvent(attributes, data)
+        
+        def send_event(self, event: CloudEvent) -> bool:
+            """发送事件到 Broker"""
+            try:
+                headers, body = to_structured(event)
+                
+                response = requests.post(
+                    self.broker_url,
+                    headers=headers,
+                    data=body,
+                    timeout=10
+                )
+                
+                if response.status_code == 202:
+                    logger.info(f"✅ Event sent: {event['type']} - {event['id'][:8]}")
+                    return True
+                else:
+                    logger.error(f"❌ Failed to send event: {response.status_code}")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"❌ Error sending event: {str(e)}")
+                return False
+        
+        def generate_demo_events(self):
+            """生成不同类型的演示事件"""
+            events = [
+                {
+                    "type": "demo.event",
+                    "data": {
+                        "message": f"Demo event #{self.event_counter + 1}",
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "demo_type": "periodic"
+                    }
+                },
+                {
+                    "type": "user.created", 
+                    "data": {
+                        "user_id": f"user_{self.event_counter + 1}",
+                        "username": f"demo_user_{self.event_counter + 1}",
+                        "email": f"user{self.event_counter + 1}@example.com",
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                },
+                {
+                    "type": "order.placed",
+                    "data": {
+                        "order_id": f"order_{self.event_counter + 1}",
+                        "user_id": f"user_{(self.event_counter % 10) + 1}",
+                        "amount": round((self.event_counter % 100 + 10) * 1.99, 2),
+                        "items": [f"item_{i}" for i in range(1, (self.event_counter % 3) + 2)],
+                        "placed_at": datetime.utcnow().isoformat()
+                    }
+                }
+            ]
+            
+            # 轮流发送不同类型的事件
+            selected_event = events[self.event_counter % len(events)]
+            return selected_event
+        
+        def run(self):
+            """主运行循环"""
+            logger.info("🚀 Starting event producer loop...")
+            
+            while True:
+                try:
+                    # 生成事件
+                    event_data = self.generate_demo_events()
+                    event = self.create_event(event_data["type"], event_data["data"])
+                    
+                    # 发送事件
+                    success = self.send_event(event)
+                    
+                    if success:
+                        logger.info(f"📊 Total events sent: {self.event_counter}")
+                    
+                    # 等待下一次发送
+                    time.sleep(self.interval)
+                    
+                except KeyboardInterrupt:
+                    logger.info("👋 Producer stopped by user")
+                    break
+                except Exception as e:
+                    logger.error(f"💥 Unexpected error: {str(e)}")
+                    time.sleep(5)  # 出错后等待5秒再继续
+    
+    if __name__ == "__main__":
+        producer = SimpleEventProducer()
+        producer.run()
+
+  startup.sh: |
+    #!/bin/bash
+    
+    echo "🚀 Starting Knative Event Producer..."
+    
+    # 安装依赖
+    echo "📦 Installing dependencies..."
+    pip install -r /app/requirements.txt --quiet
+    
+    # 简单检查 DNS 解析 (更可靠的网络检查)
+    echo "🌐 Checking network connectivity..."
+    if python3 -c "import socket; socket.gethostbyname('kubernetes.default.svc.cluster.local')" &>/dev/null; then
+        echo "✅ Network ready (cluster DNS working)"
+    elif python3 -c "import socket; socket.create_connection(('8.8.8.8', 53), timeout=3)" &>/dev/null; then
+        echo "✅ Network ready (external connectivity working)"
+    else
+        echo "⚠️  Network check failed, but proceeding anyway..."
+    fi
+    
+    # 运行生产者
+    echo "🎯 Starting event producer..."
+    python /app/producer.py 

@@ -1,0 +1,280 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: consumer-config
+  namespace: knative-demo
+data:
+  requirements.txt: |
+    Flask==2.3.2
+    cloudevents==1.10.1
+  
+  consumer.py: |
+    #!/usr/bin/env python3
+    """
+    简化版事件消费者 - 接收和处理来自 Knative Broker 的 CloudEvents
+    """
+    
+    import os
+    import json
+    import time
+    import logging
+    from datetime import datetime
+    from typing import Dict, Any, Optional
+    
+    from flask import Flask, request, jsonify
+    from cloudevents.http import from_http
+    
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+    
+    app = Flask(__name__)
+    
+    # 环境变量配置
+    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    PROCESSING_DELAY = int(os.getenv('PROCESSING_DELAY', 1))
+    PORT = int(os.getenv('PORT', 8080))
+    
+    # 设置日志级别
+    logging.getLogger().setLevel(getattr(logging, LOG_LEVEL.upper()))
+    
+    class SimpleEventProcessor:
+        """简化的事件处理器"""
+        
+        def __init__(self):
+            self.processed_events = 0
+            self.failed_events = 0
+            self.start_time = time.time()
+            
+            logger.info("🚀 Event processor initialized")
+            logger.info(f"   Processing delay: {PROCESSING_DELAY} seconds")
+            logger.info(f"   Log level: {LOG_LEVEL}")
+        
+        def process_demo_event(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
+            """处理演示事件"""
+            message = event_data.get('message', 'No message')
+            logger.info(f"🎯 Processing demo event: {message}")
+            
+            # 模拟处理时间
+            time.sleep(PROCESSING_DELAY)
+            
+            return {
+                'status': 'processed',
+                'event_type': 'demo.event',
+                'original_message': message,
+                'processed_at': datetime.utcnow().isoformat(),
+                'processing_time': PROCESSING_DELAY
+            }
+        
+        def process_user_created_event(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
+            """处理用户创建事件"""
+            user_id = event_data.get('user_id', 'unknown')
+            username = event_data.get('username', 'unknown')
+            email = event_data.get('email', 'unknown')
+            
+            logger.info(f"👤 Processing user created: {username} ({user_id})")
+            
+            # 模拟处理步骤
+            processing_steps = [
+                f"✅ Validate user data for {username}",
+                f"✅ Send welcome email to {email}",
+                f"✅ Initialize user preferences",
+                f"✅ Log user registration: {user_id}"
+            ]
+            
+            for step in processing_steps:
+                logger.info(f"   {step}")
+                time.sleep(0.2)  # 模拟每个步骤的处理时间
+            
+            return {
+                'status': 'processed',
+                'event_type': 'user.created',
+                'user_id': user_id,
+                'username': username,
+                'processing_steps': processing_steps,
+                'processed_at': datetime.utcnow().isoformat()
+            }
+        
+        def process_order_placed_event(self, event_data: Dict[str, Any]) -> Dict[str, Any]:
+            """处理订单创建事件"""
+            order_id = event_data.get('order_id', 'unknown')
+            user_id = event_data.get('user_id', 'unknown')
+            amount = event_data.get('amount', 0)
+            items = event_data.get('items', [])
+            
+            logger.info(f"🛒 Processing order: {order_id} (User: {user_id}, Amount: ${amount})")
+            logger.info(f"   Items: {', '.join(items)}")
+            
+            # 模拟订单处理逻辑
+            processing_steps = [
+                f"✅ Validate order {order_id}",
+                f"✅ Check inventory for {len(items)} items",
+                f"✅ Process payment: ${amount}",
+                f"✅ Send order confirmation to user {user_id}"
+            ]
+            
+            for step in processing_steps:
+                logger.info(f"   {step}")
+                time.sleep(0.3)  # 模拟处理时间
+            
+            return {
+                'status': 'processed',
+                'event_type': 'order.placed',
+                'order_id': order_id,
+                'user_id': user_id,
+                'amount': amount,
+                'items_count': len(items),
+                'processing_steps': processing_steps,
+                'processed_at': datetime.utcnow().isoformat()
+            }
+        
+        def process_event(self, cloud_event) -> Dict[str, Any]:
+            """根据事件类型处理事件"""
+            event_type = cloud_event['type']
+            event_data = cloud_event.data or {}
+            event_id = cloud_event['id']
+            
+            logger.info(f"📨 Received event: {event_type} (ID: {event_id[:8]}...)")
+            
+            try:
+                if event_type == 'demo.event':
+                    result = self.process_demo_event(event_data)
+                elif event_type == 'user.created':
+                    result = self.process_user_created_event(event_data)
+                elif event_type == 'order.placed':
+                    result = self.process_order_placed_event(event_data)
+                else:
+                    logger.warning(f"❓ Unknown event type: {event_type}")
+                    result = {
+                        'status': 'unknown_type',
+                        'event_type': event_type,
+                        'message': f'No handler for event type: {event_type}',
+                        'processed_at': datetime.utcnow().isoformat()
+                    }
+                
+                self.processed_events += 1
+                logger.info(f"✅ Event processed successfully (Total: {self.processed_events})")
+                return result
+                
+            except Exception as e:
+                self.failed_events += 1
+                error_msg = f"💥 Error processing event {event_id}: {str(e)}"
+                logger.error(error_msg)
+                return {
+                    'status': 'error',
+                    'error': str(e),
+                    'event_id': event_id,
+                    'processed_at': datetime.utcnow().isoformat()
+                }
+    
+    # 初始化事件处理器
+    processor = SimpleEventProcessor()
+    
+    @app.route('/', methods=['POST'])
+    def handle_event():
+        """Knative 事件处理端点"""
+        try:
+            # 从 HTTP 请求中解析 CloudEvent
+            cloud_event = from_http(request.headers, request.get_data())
+            
+            # 处理事件
+            result = processor.process_event(cloud_event)
+            
+            # 返回成功响应 (Knative 期望 2xx 响应)
+            return jsonify({
+                'event_id': cloud_event['id'],
+                'processing_result': result,
+                'timestamp': datetime.utcnow().isoformat()
+            }), 200
+            
+        except Exception as e:
+            error_msg = f"💥 Error handling event: {str(e)}"
+            logger.error(error_msg)
+            # 返回错误响应 (Knative 会重试)
+            return jsonify({
+                'error': str(e),
+                'timestamp': datetime.utcnow().isoformat()
+            }), 500
+    
+    @app.route('/health', methods=['GET'])
+    def health_check():
+        """健康检查端点"""
+        uptime = time.time() - processor.start_time
+        return jsonify({
+            'status': 'healthy',
+            'service': 'event-consumer',
+            'uptime_seconds': round(uptime, 2),
+            'processed_events': processor.processed_events,
+            'failed_events': processor.failed_events,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    
+    @app.route('/metrics', methods=['GET'])
+    def metrics():
+        """指标端点"""
+        uptime = time.time() - processor.start_time
+        total_events = processor.processed_events + processor.failed_events
+        
+        return jsonify({
+            'processed_events': processor.processed_events,
+            'failed_events': processor.failed_events,
+            'total_events': total_events,
+            'success_rate': round((processor.processed_events / max(total_events, 1)) * 100, 2),
+            'uptime_seconds': round(uptime, 2),
+            'events_per_minute': round((total_events / max(uptime / 60, 1)), 2)
+        })
+    
+    @app.route('/stats', methods=['GET'])
+    def stats():
+        """详细统计信息"""
+        uptime = time.time() - processor.start_time
+        total_events = processor.processed_events + processor.failed_events
+        
+        return jsonify({
+            'service': 'event-consumer',
+            'statistics': {
+                'total_events': total_events,
+                'successful_events': processor.processed_events,
+                'failed_events': processor.failed_events,
+                'success_rate_percent': round((processor.processed_events / max(total_events, 1)) * 100, 2),
+                'uptime_seconds': round(uptime, 2),
+                'events_per_second': round(total_events / max(uptime, 1), 2),
+                'avg_processing_time': PROCESSING_DELAY
+            },
+            'configuration': {
+                'processing_delay': PROCESSING_DELAY,
+                'log_level': LOG_LEVEL,
+                'port': PORT
+            },
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    
+    if __name__ == "__main__":
+        logger.info(f"🚀 Starting Event Consumer Service on port {PORT}")
+        app.run(host='0.0.0.0', port=PORT, debug=False)
+
+  startup.sh: |
+    #!/bin/bash
+    
+    echo "🚀 Starting Knative Event Consumer..."
+    
+    # 安装依赖
+    echo "📦 Installing dependencies..."
+    pip install -r /app/requirements.txt --quiet
+    
+    # 简单检查 DNS 解析 (更可靠的网络检查)
+    echo "🌐 Checking network connectivity..."
+    if python3 -c "import socket; socket.gethostbyname('kubernetes.default.svc.cluster.local')" &>/dev/null; then
+        echo "✅ Network ready (cluster DNS working)"
+    elif python3 -c "import socket; socket.create_connection(('8.8.8.8', 53), timeout=3)" &>/dev/null; then
+        echo "✅ Network ready (external connectivity working)"
+    else
+        echo "⚠️  Network check failed, but proceeding anyway..."
+    fi
+    
+    # 直接使用 Python 运行 (demo 环境更简单可靠)
+    echo "🎯 Starting event consumer..."
+    exec python /app/consumer.py 

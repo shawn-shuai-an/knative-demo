@@ -1,0 +1,50 @@
+---
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: demo-event-trigger
+  namespace: knative-demo
+spec:
+  broker: default
+  filter:
+    attributes:
+      type: demo.event
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: event-consumer-service
+
+---
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: user-created-trigger
+  namespace: knative-demo
+spec:
+  broker: default
+  filter:
+    attributes:
+      type: user.created
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: event-consumer-service
+
+---
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: order-placed-trigger
+  namespace: knative-demo
+spec:
+  broker: default
+  filter:
+    attributes:
+      type: order.placed
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: event-consumer-service 
