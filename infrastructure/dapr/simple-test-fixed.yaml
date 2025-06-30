@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dapr-simple-test-fixed
+  namespace: dapr-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: simple-test-fixed
+  template:
+    metadata:
+      labels:
+        app: simple-test-fixed
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "simple-test-fixed"
+        dapr.io/app-port: "8080"
+    spec:
+      containers:
+      - name: app
+        image: python:3.9-alpine
+        ports:
+        - containerPort: 8080
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          # 安装依赖
+          pip install flask requests
+          
+          # 创建修复版本的Python应用
+          cat > /tmp/app.py << 'EOF'
+          import json
+          import time
+          import requests
+          import threading
+          from flask import Flask, request, jsonify, Response
+          
+          app = Flask(__name__)
+          
+          @app.route('/dapr/subscribe', methods=['GET'])
+          def subscribe():
+              # 告诉Dapr我们要订阅pod-events topic
+              subscriptions = [
+                  {
+                      "pubsubname": "pubsub",
+                      "topic": "pod-events", 
+                      "route": "/pod-events"
+                  }
+              ]
+              print(f"📋 Subscription config requested: {subscriptions}")
+              return jsonify(subscriptions)
+          
+          @app.route('/pod-events', methods=['POST'])
+          def handle_pod_events():
+              # 处理接收到的事件
+              event_data = request.get_json()
+              print(f"🔥 Received event: {event_data}")
+              
+              # 提取消息内容
+              if event_data and 'data' in event_data:
+                  message = event_data['data'].get('message', 'unknown')
+                  timestamp = event_data['data'].get('timestamp', 'unknown')
+                  source = event_data['data'].get('source', 'unknown')
+                  print(f"📋 Message: {message} from {source} at {timestamp}")
+              
+              # Dapr期望的正确响应：空响应体和200状态码
+              return Response(status=200)
+          
+          @app.route('/health', methods=['GET'])
+          def health():
+              return jsonify({"status": "healthy"})
+          
+          @app.route('/', methods=['GET'])
+          def root():
+              return "Fixed Dapr Test App is running!"
+          
+          def publish_messages():
+              """定期发布测试消息"""
+              time.sleep(30)  # 等待应用启动
+              counter = 1
+              
+              while True:
+                  try:
+                      message = {
+                          "message": f"Fixed test message {counter}",
+                          "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                          "source": "simple-test-fixed"
+                      }
+                      
+                      # 发布到Dapr
+                      response = requests.post(
+                          "http://localhost:3500/v1.0/publish/pubsub/pod-events",
+                          json=message,
+                          timeout=5
+                      )
+                      
+                      if response.status_code == 204:
+                          print(f"✅ Published message {counter}")
+                      else:
+                          print(f"❌ Failed to publish message {counter}: {response.status_code}")
+                      
+                  except Exception as e:
+                      print(f"❌ Error publishing message {counter}: {e}")
+                  
+                  counter += 1
+                  time.sleep(20)
+          
+          if __name__ == '__main__':
+              # 启动后台发布线程
+              publisher_thread = threading.Thread(target=publish_messages, daemon=True)
+              publisher_thread.start()
+              
+              print("🚀 Starting fixed Dapr test app...")
+              app.run(host='0.0.0.0', port=8080, debug=False)
+          EOF
+          
+          echo "Starting fixed Python app..."
+          python /tmp/app.py
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: simple-test-fixed-service
+  namespace: dapr-demo
+spec:
+  selector:
+    app: simple-test-fixed
+  ports:
+  - port: 8080
+    targetPort: 8080 

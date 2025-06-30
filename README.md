@@ -1,171 +1,169 @@
 # Knative Demo Project
 
-基于 Knative Eventing 的事件驱动架构演示项目，展示生产者-消费者模式的事件处理。
+这是一个基于 Knative 的完整演示项目，展示了事件驱动架构的实现，并提供了与 Dapr 的全面对比分析。
 
 ## 项目结构
 
 ```
 knative_demo/
-├── producer/                    # 🚫 历史代码 (已弃用)
-├── consumer/                    # 🚫 历史代码 (已弃用)
-├── infrastructure/              # ✅ Knative 基础设施配置
-│   ├── knative/                # Knative 资源定义
-│   ├── kubernetes/             # ConfigMap 代码注入
-│   └── scripts/                # 部署脚本
-├── scripts/                    # ✅ 全局脚本
-└── README.md                   # 项目说明
+├── producer/           # 事件生产者服务
+├── consumer/           # 事件消费者服务
+├── infrastructure/     # Knative 基础设施配置
+├── scripts/           # 部署和管理脚本
+├── docs/              # 详细文档
+└── dapr/              # Dapr 对比实现
 ```
 
-> **📝 架构说明**: 项目已升级为**零镜像构建**架构，使用通用 Python 镜像 + ConfigMap 注入代码的方式部署。
+## 🚀 快速开始
 
-## 架构说明
+### 前置条件
+- Kubernetes 集群 (v1.28+)
+- kubectl 已配置
+- 已安装 Knative Eventing
 
-此项目演示了 Knative Eventing 的核心概念：
-
-- **Producer**: 使用通用 Python 镜像 + ConfigMap，**定时自动**产生 CloudEvents 格式的事件
-- **Consumer**: 使用通用 Python 镜像 + ConfigMap，智能处理不同类型的事件 
-- **Broker**: 事件路由中心，接收和分发事件
-- **Trigger**: 事件过滤和路由规则，将特定类型的事件转发给消费者
-
-> **特点**: 
-> - 只使用 Knative Eventing，不依赖 Knative Serving
-> - Producer 无需构建自定义镜像，使用 ConfigMap 注入代码
-> - Consumer 无需构建自定义镜像，使用 ConfigMap 注入代码
-> - 自动化事件生成，适合演示和测试
-
-## 快速开始
-
-### 前提条件
-
-- Kubernetes 集群
-- **仅需要** Knative Eventing (不需要 Knative Serving)
-- kubectl 已配置 (无需 Docker！)
-
-### 安装 Knative Eventing
-
+### 部署演示
 ```bash
-# 安装 Knative Eventing CRDs
-kubectl apply -f https://github.com/knative/eventing/releases/download/knative-v1.12.0/eventing-crds.yaml
+# 部署 Knative 演示
+./scripts/deploy-all.sh
 
-# 安装 Knative Eventing 核心组件
-kubectl apply -f https://github.com/knative/eventing/releases/download/knative-v1.12.0/eventing-core.yaml
+# 查看运行状态
+kubectl get pods -n knative-demo
+kubectl get triggers -n knative-demo
 
-# 安装 In-Memory Channel (用于开发测试)
-kubectl apply -f https://github.com/knative/eventing/releases/download/knative-v1.12.0/in-memory-channel.yaml
-
-# 安装 MT Channel Broker
-kubectl apply -f https://github.com/knative/eventing/releases/download/knative-v1.12.0/mt-channel-broker.yaml
+# 清理资源
+./scripts/cleanup.sh
 ```
 
-### 部署步骤
+## 📊 Knative vs Dapr 对比分析
 
-#### 方法1: 一键部署 (推荐)
-   ```bash
-   # 完整的部署流程 (无需 Docker!)
-   ./scripts/deploy-all.sh
-   ```
+本项目提供了 Knative 和 Dapr 的全面对比分析，包括：
 
-#### 方法2: 分步部署
-1. **检查镜像状态** (无需构建，使用通用镜像)
-   ```bash
-   ./scripts/build-all.sh
-   ```
+### 🎯 系统资源要求对比
 
-2. **创建基础设施**
-   ```bash
-   cd infrastructure
-   ./scripts/setup.sh
-   ```
+| 维度 | Knative | Dapr | 优势方 |
+|------|---------|------|---------|
+| **集群最低要求** | 6 cores + 6GB | 2 cores + 2GB | Dapr |
+| **Control Plane** | 520m CPU + 520Mi | 550m CPU + 235Mi | 接近 |
+| **应用扩展性** | 固定开销 | 线性增长 | **Knative** |
+| **100 应用总开销** | 520m + 520Mi | 10.6 cores + 25Gi | **Knative** |
 
-#### 快速测试
-   ```bash
-   # 自动化测试脚本
-   ./scripts/quick-test.sh
-   ```
+**关键洞察**：
+- 小规模（<10 服务）：Dapr 开销可接受
+- 中大规模（>50 服务）：**Knative 有压倒性优势**
+- 成本差异：在大规模部署中可达 **8-10 倍**
 
-#### 手动观察
-   ```bash
-   # 查看 Producer 日志 (自动发送事件)
-   kubectl logs -f deployment/event-producer -n knative-demo
-   
-   # 查看 Consumer 日志 (处理事件)  
-   kubectl logs -f deployment/event-consumer -n knative-demo
-   
-   # 查看事件详情
-   kubectl get events -n knative-demo --sort-by='.lastTimestamp'
-   ```
+### 📈 监控能力对比
 
-## 事件类型
+| 监控维度 | Knative | Dapr | 说明 |
+|---------|---------|------|------|
+| **消息堆积计算** | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | Dapr 提供精确指标 |
+| **Prometheus 查询** | 复杂 | 简单 | Dapr 一行查询获得结果 |
+| **Grafana Dashboard** | ⭐⭐⭐ | ⭐⭐⭐⭐⭐ | Dapr 指标更直观 |
+| **业务指标精度** | ⭐⭐ | ⭐⭐⭐⭐⭐ | Dapr 提供真实业务延迟 |
 
-项目支持以下事件类型：
+### 🔧 架构模式对比
 
+**Knative**：事件扇出模式
+```
+Producer → Broker → Trigger → Consumer (多播)
+```
+
+**Dapr**：竞争消费模式
+```
+Publisher → Pub/Sub Component → Subscriber (单播)
+```
+
+## 🛠️ 实用工具
+
+### 资源监控对比
+```bash
+# 实时监控资源使用
+./scripts/resource-monitoring-comparison.sh monitor
+
+# 持续监控模式
+./scripts/resource-monitoring-comparison.sh continuous 5
+
+# 导出监控数据
+./scripts/resource-monitoring-comparison.sh export
+```
+
+### 技术选型建议
+```bash
+# 快速对比总结
+./scripts/resource-requirements-summary.sh
+
+# 交互式推荐
+./scripts/resource-requirements-summary.sh interactive
+
+# 查看优化建议
+./scripts/resource-requirements-summary.sh optimize
+```
+
+### Prometheus + Grafana 监控
+```bash
+# 部署标准监控栈
+./scripts/prometheus-grafana-comparison.sh deploy
+
+# 查看查询语句对比
+./scripts/prometheus-grafana-comparison.sh queries
+
+# 监控能力对比
+./scripts/prometheus-grafana-comparison.sh compare
+```
+
+## 📚 详细文档
+
+### 核心对比文档
+- [系统资源要求对比](docs/system-resource-requirements-comparison.md)
+- [Prometheus + Grafana 监控对比](docs/prometheus-grafana-monitoring-comparison.md)
+- [架构总结](docs/architecture-summary.md)
+
+### 特定场景分析
+- [单一消费者场景对比](docs/single-consumer-comparison.md)
+- [多消费者场景对比](docs/multi-consumer-scenario.md)
+- [消费者组机制分析](docs/consumer-group-mechanism.md)
+- [多语言支持对比](docs/multi-language-comparison.md)
+
+### 实施指南
+- [生产部署指南](docs/production-deployment-guide.md)
+- [Dapr 安装指南](docs/dapr-installation-guide.md)
+- [监控配置指南](docs/dapr-metrics-monitoring-guide.md)
+
+## 🎯 选择建议
+
+### 选择 Knative 的场景
+- ✅ **大规模部署**（>50 服务）
+- ✅ **成本敏感**项目
+- ✅ **事件驱动**架构为主
+- ✅ **Serverless** 需求
+
+### 选择 Dapr 的场景
+- ✅ **小规模部署**（<50 服务）
+- ✅ **低延迟**要求
+- ✅ **丰富微服务功能**需求
+- ✅ **多语言混合**开发
+
+## 🔍 项目特色
+
+### 零镜像构建架构
+- Producer 和 Consumer 都使用通用镜像
+- 代码通过 ConfigMap 注入
+- 完全不需要构建自定义镜像
+
+### 多事件类型支持
 - `demo.event` - 演示事件
 - `user.created` - 用户创建事件
 - `order.placed` - 订单创建事件
 
-## 组件说明
+### 完整监控方案
+- 实时资源使用监控
+- 消息堆积和处理速度监控
+- 成本分析和优化建议
 
-### 🤖 自动化 Producer
-- **镜像**: `python:3.11-slim` (通用镜像)
-- **代码**: 通过 ConfigMap 注入
-- **功能**: 每 10 秒自动发送一个事件
-- **事件类型**: 轮流发送 `demo.event`、`user.created`、`order.placed`
+## 🤝 贡献
 
-### 🔧 智能 Consumer
-- **镜像**: `python:3.11-slim` (通用镜像)
-- **代码**: 通过 ConfigMap 注入
-- **副本数**: 2 个实例并行处理
-- **API 接口**:
-  - `POST /` - 接收 CloudEvents (Knative 事件入口)
-  - `GET /health` - 健康检查
-  - `GET /metrics` - 指标信息
-  - `GET /stats` - 详细统计信息
+欢迎提交 Issue 和 Pull Request 来改进这个项目！
 
-## 代码修改
+## 📄 许可证
 
-如需修改应用逻辑：
-
-1. **编辑 ConfigMap**:
-   - Producer: `infrastructure/kubernetes/producer-configmap.yaml`
-   - Consumer: `infrastructure/kubernetes/consumer-configmap.yaml`
-
-2. **重新部署**:
-   ```bash
-   kubectl apply -f infrastructure/kubernetes/producer-configmap.yaml
-   kubectl apply -f infrastructure/kubernetes/consumer-configmap.yaml
-   kubectl rollout restart deployment/event-producer -n knative-demo
-   kubectl rollout restart deployment/event-consumer -n knative-demo
-   ```
-
-## 监控和调试
-
-```bash
-# 查看所有资源
-kubectl get all -n knative-demo
-
-# 查看 Broker 状态
-kubectl get broker -n knative-demo
-
-# 查看 Trigger 状态
-kubectl get trigger -n knative-demo
-
-# 查看事件流
-kubectl get events -n knative-demo --sort-by='.lastTimestamp'
-```
-
-## 清理环境
-
-```bash
-cd infrastructure
-./scripts/cleanup.sh
-```
-
-## 技术栈
-
-- **事件系统**: Knative Eventing
-- **容器编排**: Kubernetes
-- **基础镜像**: Python 3.11 Slim (官方镜像)
-- **代码注入**: Kubernetes ConfigMap
-- **Web 框架**: Flask + Gunicorn
-- **事件标准**: CloudEvents
-- **部署方式**: 零镜像构建 
+本项目采用 MIT 许可证。 

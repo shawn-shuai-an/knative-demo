@@ -1,0 +1,208 @@
+# Kafka 安装方式对比：Operator vs Helm
+
+# ==========================================
+# 方式1: Strimzi Kafka Operator (推荐)
+# ==========================================
+
+---
+# 1.1 安装 Strimzi Operator
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+
+---
+# 安装命令:
+# kubectl create namespace kafka
+# kubectl apply -f 'https://strimzi.io/install/latest?namespace=kafka' -n kafka
+
+---
+# 1.2 声明式创建 Kafka 集群 (超简单!)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: my-cluster
+  namespace: kafka
+spec:
+  kafka:
+    version: 3.6.0
+    replicas: 3
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+    storage:
+      type: persistent-claim
+      size: 10Gi
+      deleteClaim: false
+  zookeeper:
+    replicas: 3
+    storage:
+      type: persistent-claim
+      size: 5Gi
+      deleteClaim: false
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+
+# Operator 自动创建的资源:
+# - StatefulSets (Kafka + Zookeeper)
+# - Services (内部和外部访问)
+# - ConfigMaps (配置管理)
+# - Secrets (认证和TLS)
+# - PersistentVolumeClaims (存储)
+# - NetworkPolicies (网络安全)
+
+---
+# 1.3 创建 Kafka Topic (声明式)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: knative-events
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: my-cluster
+spec:
+  partitions: 10
+  replicas: 3
+  config:
+    retention.ms: 604800000  # 7 days
+    segment.bytes: 1073741824  # 1GB
+
+---
+# 1.4 创建 Kafka User (自动认证)
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: knative-user
+  namespace: kafka
+  labels:
+    strimzi.io/cluster: my-cluster
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+    - resource:
+        type: topic
+        name: knative-events
+      operations: ["Read", "Write"]
+
+# ==========================================
+# 方式2: Helm Chart 安装
+# ==========================================
+
+---
+# 2.1 Bitnami Kafka Helm Chart 配置
+# helm repo add bitnami https://charts.bitnami.com/bitnami
+# helm install kafka bitnami/kafka -f values.yaml
+
+# values.yaml 内容:
+kafka-helm-values: |
+  # 集群配置
+  replicaCount: 3
+  
+  # 持久化存储
+  persistence:
+    enabled: true
+    size: 10Gi
+    
+  # 认证配置
+  auth:
+    clientProtocol: sasl
+    sasl:
+      mechanisms: scram-sha-256,scram-sha-512
+      
+  # 资源配置
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 1Gi
+      
+  # Zookeeper 配置
+  zookeeper:
+    replicaCount: 3
+    persistence:
+      enabled: true
+      size: 5Gi
+      
+  # 监控配置
+  metrics:
+    kafka:
+      enabled: true
+    jmx:
+      enabled: true
+
+---
+# 2.2 Confluent Helm Chart (企业级)
+# helm repo add confluentinc https://confluentinc.github.io/cp-helm-charts/
+# helm install confluent confluentinc/cp-helm-charts
+
+confluent-helm-values: |
+  cp-kafka:
+    brokers: 3
+    persistence:
+      enabled: true
+      size: 10Gi
+    configurationOverrides:
+      "auto.create.topics.enable": false
+      "default.replication.factor": 3
+      
+  cp-zookeeper:
+    servers: 3
+    persistence:
+      enabled: true
+      
+  cp-schema-registry:
+    enabled: true
+    
+  cp-kafka-rest:
+    enabled: true
+    
+  cp-kafka-connect:
+    enabled: true
+
+# ==========================================
+# 方式对比表
+# ==========================================
+
+comparison-table: |
+  
+  | 特性              | Strimzi Operator | Bitnami Helm     | Confluent Helm   | 传统手动安装    |
+  |-------------------|------------------|------------------|------------------|-----------------|
+  | **安装难度**      | 🟢 很简单         | 🟡 简单           | 🟡 中等           | 🔴 复杂         |
+  | **运维自动化**    | 🚀 完全自动       | 🟡 基本自动       | 🟡 基本自动       | ❌ 手动         |
+  | **升级管理**      | 🚀 滚动升级       | 🟡 手动升级       | 🟡 手动升级       | 🔴 复杂升级     |
+  | **配置管理**      | 🚀 声明式         | 🟡 Values文件     | 🟡 Values文件     | 🔴 多文件管理   |
+  | **故障恢复**      | 🚀 自动恢复       | 🟡 半自动         | 🟡 半自动         | 🔴 手动恢复     |
+  | **扩缩容**        | 🚀 声明式扩缩     | 🟡 手动扩缩       | 🟡 手动扩缩       | 🔴 复杂扩缩     |
+  | **监控集成**      | ✅ 内置Prometheus | ✅ 可配置         | ✅ 企业级监控     | 🔴 需要自建     |
+  | **安全管理**      | 🚀 自动TLS/认证   | 🟡 可配置         | 🟡 可配置         | 🔴 手动配置     |
+  | **Topic管理**     | 🚀 K8s资源       | 🟡 外部工具       | 🟡 外部工具       | 🔴 命令行       |
+  | **用户管理**      | 🚀 K8s资源       | 🟡 外部配置       | 🟡 外部配置       | 🔴 手动配置     |
+  | **学习成本**      | 🟡 中等           | 🟢 低             | 🟡 中等           | 🔴 高           |
+  | **社区支持**      | 🚀 活跃           | 🚀 活跃           | 🟡 商业支持       | 🟡 官方文档     |
+  | **企业特性**      | 🟡 基础企业级     | 🟡 基础企业级     | 🚀 完整企业级     | 🔴 需要自建     |
+
+---
+# 推荐选择矩阵:
+#
+# 🎯 开发测试:     Bitnami Helm (快速上手)
+# 🏭 生产环境:     Strimzi Operator (最佳实践)  
+# 🏢 企业环境:     Confluent Helm (商业支持)
+# 🎓 学习研究:     手动安装 (深入理解) 

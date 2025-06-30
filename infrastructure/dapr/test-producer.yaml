@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dapr-test-producer
+  namespace: dapr-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-producer
+  template:
+    metadata:
+      labels:
+        app: test-producer
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "test-producer"
+        dapr.io/app-port: "8080"
+    spec:
+      containers:
+      - name: producer
+        image: nginx:alpine
+        ports:
+        - containerPort: 8080
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          # 创建测试脚本
+          cat > /tmp/test-producer.sh << 'EOF'
+          #!/bin/sh
+          counter=1
+          
+          # 启动简单的HTTP服务器
+          (while true; do
+            echo "HTTP/1.1 200 OK\nContent-Length: 20\n\nProducer is running" | nc -l -p 8080
+          done) &
+          
+          echo "Starting Dapr test producer..."
+          sleep 10  # 等待Dapr sidecar启动
+          
+          while true; do
+            echo "Publishing message $counter..."
+            
+            # 发送到pod-events topic
+            curl -X POST http://localhost:3500/v1.0/publish/pubsub/pod-events \
+              -H "Content-Type: application/json" \
+              -d "{\"eventType\": \"pod.test\", \"message\": \"Test message $counter\", \"timestamp\": \"$(date)\", \"source\": \"test-producer\"}" \
+              --max-time 5 --silent
+            
+            if [ $? -eq 0 ]; then
+              echo "✅ Message $counter published successfully"
+            else
+              echo "❌ Failed to publish message $counter"
+            fi
+            
+            counter=$((counter + 1))
+            sleep 10
+          done
+          EOF
+          
+          chmod +x /tmp/test-producer.sh
+          /tmp/test-producer.sh
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-producer-service
+  namespace: default
+spec:
+  selector:
+    app: test-producer
+  ports:
+  - port: 8080
+    targetPort: 8080 

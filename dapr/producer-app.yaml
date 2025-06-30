@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pub-producer
+  namespace: dapr-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "producer"
+        dapr.io/app-port: "8080"
+    spec:
+      containers:
+        - name: producer
+          image: nginx:alpine
+          ports:
+            - containerPort: 8080
+          command: ["/bin/sh"]
+          args:
+            - -c
+            - |
+              cat > /tmp/test-producer.sh << 'EOF'
+              #!/bin/sh
+              counter=1
+              while true; do
+                # 发送消息到Dapr sidecar
+                curl -X POST http://localhost:3500/v1.0/publish/pubsub/pod-events \
+                  -H "Content-Type: application/json" \
+                  -d "{\"message\": \"Test message $counter\", \"timestamp\": \"$(date)\"}"
+                echo "Published message $counter"
+                counter=$((counter + 1))
+                sleep 5
+              done
+              EOF
+              chmod +x /tmp/test-producer.sh
+              /tmp/test-producer.sh

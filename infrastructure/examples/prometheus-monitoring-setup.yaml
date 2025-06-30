@@ -1,0 +1,648 @@
+# Prometheus + Grafana 监控栈部署
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+# Prometheus 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - "/etc/prometheus/rules/*.yml"
+
+    scrape_configs:
+      # Kubernetes API Server
+      - job_name: 'kubernetes-apiservers'
+        kubernetes_sd_configs:
+        - role: endpoints
+        scheme: https
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_namespace, __meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+          action: keep
+          regex: default;kubernetes;https
+
+      # Knative Eventing 组件
+      - job_name: 'knative-eventing'
+        kubernetes_sd_configs:
+        - role: pod
+          namespaces:
+            names:
+            - knative-eventing
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_label_app]
+          action: keep
+          regex: (eventing-controller|eventing-webhook|imc-controller|imc-dispatcher|broker-ingress|broker-filter)
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+
+      # Dapr Sidecars
+      - job_name: 'dapr-sidecar'
+        kubernetes_sd_configs:
+        - role: pod
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_label_dapr_io_enabled]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_dapr_io_metrics_port]
+          action: replace
+          target_label: __address__
+          regex: (.+)
+          replacement: ${__meta_kubernetes_pod_ip}:${1}
+
+      # Dapr System Components
+      - job_name: 'dapr-system'
+        kubernetes_sd_configs:
+        - role: pod
+          namespaces:
+            names:
+            - dapr-system
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_label_app]
+          action: keep
+          regex: (dapr-operator|dapr-placement-server|dapr-sentry|dapr-sidecar-injector)
+
+      # 应用程序指标
+      - job_name: 'application-metrics'
+        kubernetes_sd_configs:
+        - role: pod
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+          action: keep
+          regex: true
+        - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+          target_label: __address__
+          regex: (.+)
+          replacement: ${__meta_kubernetes_pod_ip}:${1}
+
+    alerting:
+      alertmanagers:
+      - static_configs:
+        - targets:
+          - "alertmanager:9093"
+---
+# Prometheus 告警规则 - Knative
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: knative-alert-rules
+  namespace: monitoring
+data:
+  knative.yml: |
+    groups:
+    - name: knative.eventing
+      rules:
+      - alert: KnativeBrokerHighErrorRate
+        expr: |
+          (
+            rate(event_count{broker_name="default", response_code!="202"}[5m]) /
+            rate(event_count{broker_name="default"}[5m])
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Knative Broker {{$labels.broker_name}} has high error rate"
+          description: "Error rate is {{ $value | humanizePercentage }}"
+
+      - alert: KnativeTriggerProcessingLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(event_processing_latencies_bucket{trigger_name=~".*"}[5m])) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Knative Trigger {{$labels.trigger_name}} has high processing latency"
+          description: "P95 latency is {{ $value }}ms"
+
+      - alert: KnativeEventSourceDown
+        expr: |
+          rate(event_count{event_source=~".*"}[5m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Knative event source {{$labels.event_source}} stopped producing events"
+
+      - alert: KnativeChannelBacklogEstimate
+        expr: |
+          (
+            increase(event_count{broker_name="default", response_code="202"}[10m]) -
+            increase(event_count{trigger_name=~".*", response_code="200"}[10m])
+          ) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Estimated event backlog is high"
+          description: "Approximately {{ $value }} events may be backed up"
+---
+# Prometheus 告警规则 - Dapr
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dapr-alert-rules
+  namespace: monitoring
+data:
+  dapr.yml: |
+    groups:
+    - name: dapr.pubsub
+      rules:
+      - alert: DaprMessageBacklogHigh
+        expr: |
+          (
+            sum(dapr_component_pubsub_egress_count{component="pubsub", topic="pod-events"}) -
+            sum(dapr_component_pubsub_ingress_count{component="pubsub", topic="pod-events"})
+          ) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dapr message backlog is high: {{$value}} messages"
+          description: "Topic pod-events has {{$value}} unprocessed messages"
+
+      - alert: DaprConsumerProcessingFailure
+        expr: |
+          (
+            rate(dapr_component_pubsub_ingress_count{process_status="failure"}[5m]) /
+            rate(dapr_component_pubsub_ingress_count[5m])
+          ) > 0.10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dapr consumer {{$labels.app_id}} has high failure rate"
+          description: "Failure rate is {{ $value | humanizePercentage }}"
+
+      - alert: DaprProcessingLatencyHigh
+        expr: |
+          histogram_quantile(0.95, rate(dapr_component_pubsub_ingress_latencies_bucket{app_id="consumer"}[5m])) > 5000
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dapr consumer {{$labels.app_id}} processing latency is high"
+          description: "P95 latency is {{ $value }}ms"
+
+      - alert: DaprPublisherDown
+        expr: |
+          rate(dapr_component_pubsub_egress_count{app_id="producer"}[5m]) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Dapr publisher {{$labels.app_id}} stopped publishing messages"
+
+      - alert: DaprConsumerLag
+        expr: |
+          (
+            rate(dapr_component_pubsub_egress_count{component="pubsub"}[5m]) -
+            rate(dapr_component_pubsub_ingress_count{component="pubsub"}[5m])
+          ) > 10
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Dapr consumer is lagging behind producer"
+          description: "Consumer lag rate is {{ $value }} msgs/sec"
+---
+# Prometheus Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.45.0
+        args:
+          - '--config.file=/etc/prometheus/prometheus.yml'
+          - '--storage.tsdb.path=/prometheus/'
+          - '--storage.tsdb.retention.time=30d'
+          - '--web.console.libraries=/etc/prometheus/console_libraries'
+          - '--web.console.templates=/etc/prometheus/consoles'
+          - '--web.enable-lifecycle'
+        ports:
+        - containerPort: 9090
+        volumeMounts:
+        - name: prometheus-config
+          mountPath: /etc/prometheus/
+        - name: prometheus-rules
+          mountPath: /etc/prometheus/rules/
+        - name: prometheus-storage
+          mountPath: /prometheus/
+      volumes:
+      - name: prometheus-config
+        configMap:
+          name: prometheus-config
+      - name: prometheus-rules
+        projected:
+          sources:
+          - configMap:
+              name: knative-alert-rules
+          - configMap:
+              name: dapr-alert-rules
+      - name: prometheus-storage
+        emptyDir: {}
+---
+# Prometheus Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  selector:
+    app: prometheus
+  ports:
+  - port: 9090
+    targetPort: 9090
+  type: ClusterIP
+---
+# Grafana 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+data:
+  prometheus.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      url: http://prometheus:9090
+      access: proxy
+      isDefault: true
+---
+# Grafana Dashboard - Knative
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: knative-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  knative-eventing.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "title": "Knative Eventing Monitoring",
+        "tags": ["knative"],
+        "style": "dark",
+        "timezone": "browser",
+        "panels": [
+          {
+            "id": 1,
+            "title": "Broker Event Rate",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "rate(event_count{broker_name=\"default\", response_code=\"202\"}[5m])",
+                "legendFormat": "Events Received/sec",
+                "refId": "A"
+              },
+              {
+                "expr": "rate(event_count{broker_name=\"default\", response_code!=\"202\"}[5m])",
+                "legendFormat": "Failed Events/sec",
+                "refId": "B"
+              }
+            ],
+            "yAxes": [
+              {
+                "label": "Events/sec",
+                "min": 0
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+          {
+            "id": 2,
+            "title": "Trigger Processing",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "rate(event_count{trigger_name=~\".*\", response_code=\"200\"}[5m])",
+                "legendFormat": "{{trigger_name}} - Processed/sec",
+                "refId": "A"
+              }
+            ],
+            "yAxes": [
+              {
+                "label": "Events/sec",
+                "min": 0
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+          {
+            "id": 3,
+            "title": "Event Processing Latency",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.50, rate(event_processing_latencies_bucket{trigger_name=~\".*\"}[5m]))",
+                "legendFormat": "P50",
+                "refId": "A"
+              },
+              {
+                "expr": "histogram_quantile(0.95, rate(event_processing_latencies_bucket{trigger_name=~\".*\"}[5m]))",
+                "legendFormat": "P95",
+                "refId": "B"
+              },
+              {
+                "expr": "histogram_quantile(0.99, rate(event_processing_latencies_bucket{trigger_name=~\".*\"}[5m]))",
+                "legendFormat": "P99",
+                "refId": "C"
+              }
+            ],
+            "yAxes": [
+              {
+                "label": "Latency (ms)",
+                "min": 0
+              }
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+          },
+          {
+            "id": 4,
+            "title": "Estimated Event Backlog",
+            "type": "singlestat",
+            "targets": [
+              {
+                "expr": "increase(event_count{broker_name=\"default\", response_code=\"202\"}[1h]) - increase(event_count{trigger_name=~\".*\", response_code=\"200\"}[1h])",
+                "refId": "A"
+              }
+            ],
+            "valueName": "current",
+            colorBackground": true,
+            "thresholds": "0,100,1000",
+            "colors": ["green", "yellow", "red"],
+            "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16}
+          }
+        ],
+        "time": {"from": "now-1h", "to": "now"},
+        "refresh": "30s"
+      }
+    }
+---
+# Grafana Dashboard - Dapr
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dapr-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  dapr-pubsub.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "title": "Dapr Pub/Sub Monitoring",
+        "tags": ["dapr"],
+        "style": "dark",
+        "timezone": "browser",
+        "panels": [
+          {
+            "id": 1,
+            "title": "Message Throughput",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "rate(dapr_component_pubsub_egress_count{component=\"pubsub\"}[5m])",
+                "legendFormat": "{{app_id}} - Published/sec",
+                "refId": "A"
+              },
+              {
+                "expr": "rate(dapr_component_pubsub_ingress_count{component=\"pubsub\"}[5m])",
+                "legendFormat": "{{app_id}} - Consumed/sec",
+                "refId": "B"
+              }
+            ],
+            "yAxes": [
+              {
+                "label": "Messages/sec",
+                "min": 0
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+          {
+            "id": 2,
+            "title": "Message Backlog",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum by (topic) (dapr_component_pubsub_egress_count{component=\"pubsub\"} - dapr_component_pubsub_ingress_count{component=\"pubsub\"})",
+                "legendFormat": "{{topic}} - Backlog",
+                "refId": "A"
+              }
+            ],
+            "yAxes": [
+              {
+                "label": "Messages",
+                "min": 0
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+          {
+            "id": 3,
+            "title": "Processing Latency",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.50, rate(dapr_component_pubsub_ingress_latencies_bucket{app_id=\"consumer\"}[5m]))",
+                "legendFormat": "P50",
+                "refId": "A"
+              },
+              {
+                "expr": "histogram_quantile(0.95, rate(dapr_component_pubsub_ingress_latencies_bucket{app_id=\"consumer\"}[5m]))",
+                "legendFormat": "P95",
+                "refId": "B"
+              },
+              {
+                "expr": "histogram_quantile(0.99, rate(dapr_component_pubsub_ingress_latencies_bucket{app_id=\"consumer\"}[5m]))",
+                "legendFormat": "P99",
+                "refId": "C"
+              }
+            ],
+            "yAxes": [
+              {
+                "label": "Latency (ms)",
+                "min": 0
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+          },
+          {
+            "id": 4,
+            "title": "Success Rate",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "(rate(dapr_component_pubsub_egress_count{success=\"true\"}[5m]) / rate(dapr_component_pubsub_egress_count[5m])) * 100",
+                "legendFormat": "{{app_id}} - Publish Success %",
+                "refId": "A"
+              },
+              {
+                "expr": "(rate(dapr_component_pubsub_ingress_count{process_status=\"success\"}[5m]) / rate(dapr_component_pubsub_ingress_count[5m])) * 100",
+                "legendFormat": "{{app_id}} - Process Success %",
+                "refId": "B"
+              }
+            ],
+            "yAxes": [
+              {
+                "label": "Success Rate %",
+                "min": 0,
+                "max": 100
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+          },
+          {
+            "id": 5,
+            "title": "Current Message Backlog",
+            "type": "singlestat",
+            "targets": [
+              {
+                "expr": "sum(dapr_component_pubsub_egress_count{component=\"pubsub\", topic=\"pod-events\"}) - sum(dapr_component_pubsub_ingress_count{component=\"pubsub\", topic=\"pod-events\"})",
+                "refId": "A"
+              }
+            ],
+            "valueName": "current",
+            "colorBackground": true,
+            "thresholds": "0,100,1000",
+            "colors": ["green", "yellow", "red"],
+            "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16}
+          },
+          {
+            "id": 6,
+            "title": "Per-Topic Analysis",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "rate(dapr_component_pubsub_ingress_count{component=\"pubsub\"}[5m])",
+                "legendFormat": "{{topic}} - {{app_id}}",
+                "refId": "A"
+              }
+            ],
+            "yAxes": [
+              {
+                "label": "Messages/sec",
+                "min": 0
+              }
+            ],
+            "gridPos": {"h": 8, "w": 18, "x": 6, "y": 16}
+          }
+        ],
+        "time": {"from": "now-1h", "to": "now"},
+        "refresh": "30s"
+      }
+    }
+---
+# Grafana Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:10.0.0
+        ports:
+        - containerPort: 3000
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: "admin123"
+        - name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH
+          value: "/var/lib/grafana/dashboards/knative-eventing.json"
+        volumeMounts:
+        - name: grafana-datasources
+          mountPath: /etc/grafana/provisioning/datasources
+        - name: grafana-dashboards-config
+          mountPath: /etc/grafana/provisioning/dashboards
+        - name: grafana-dashboards
+          mountPath: /var/lib/grafana/dashboards
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+      volumes:
+      - name: grafana-datasources
+        configMap:
+          name: grafana-datasources
+      - name: grafana-dashboards-config
+        configMap:
+          name: grafana-dashboard-config
+      - name: grafana-dashboards
+        projected:
+          sources:
+          - configMap:
+              name: knative-dashboard
+          - configMap:
+              name: dapr-dashboard
+      - name: grafana-storage
+        emptyDir: {}
+---
+# Grafana Dashboard 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-config
+  namespace: monitoring
+data:
+  dashboard.yaml: |
+    apiVersion: 1
+    providers:
+    - name: 'default'
+      orgId: 1
+      folder: ''
+      type: file
+      disableDeletion: false
+      editable: true
+      options:
+        path: /var/lib/grafana/dashboards
+---
+# Grafana Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  selector:
+    app: grafana
+  ports:
+  - port: 3000
+    targetPort: 3000
+  type: ClusterIP 

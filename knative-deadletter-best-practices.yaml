@@ -1,0 +1,455 @@
+# Knative 死信队列最佳实践演示
+# 完整的错误处理和死信队列配置
+
+---
+# 1. 命名空间
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: knative-deadletter-demo
+
+---
+# 2. 主 Broker - 处理正常事件
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: main-broker
+  namespace: knative-deadletter-demo
+  annotations:
+    eventing.knative.dev/broker.class: MTChannelBasedBroker
+spec:
+  # 可选：配置 Kafka 以获得更好的持久化
+  # config:
+  #   apiVersion: v1
+  #   kind: ConfigMap
+  #   name: kafka-broker-config
+  #   namespace: knative-eventing
+
+---
+# 3. 死信 Broker - 处理失败事件
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: deadletter-broker
+  namespace: knative-deadletter-demo
+  annotations:
+    eventing.knative.dev/broker.class: MTChannelBasedBroker
+
+---
+# 4. 死信处理服务 ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deadletter-handler-code
+  namespace: knative-deadletter-demo
+data:
+  main.py: |
+    #!/usr/bin/env python3
+    """
+    Knative 死信处理器 - 最佳实践实现
+    负责处理失败的事件，进行日志记录、告警和重新路由
+    """
+    
+    import json
+    import time
+    import logging
+    from datetime import datetime
+    from flask import Flask, request, jsonify
+    
+    # 配置日志
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
+    app = Flask(__name__)
+    
+    # 死信处理统计
+    deadletter_stats = {
+        'total_deadletters': 0,
+        'by_event_type': {},
+        'by_failure_reason': {},
+        'start_time': time.time()
+    }
+    
+    @app.route('/', methods=['POST'])
+    def handle_deadletter():
+        """
+        死信处理主入口
+        处理所有到达死信队列的事件
+        """
+        global deadletter_stats
+        
+        try:
+            # 解析 CloudEvent
+            headers = dict(request.headers)
+            event_data = request.get_json() or {}
+            
+            # 提取事件信息
+            event_type = headers.get('Ce-Type', 'unknown')
+            event_id = headers.get('Ce-Id', 'unknown')
+            event_source = headers.get('Ce-Source', 'unknown')
+            
+            # 提取失败原因（如果有的话）
+            failure_reason = headers.get('Ce-Knative-Error-Code', 'unknown')
+            original_destination = headers.get('Ce-Knative-Error-Destination', 'unknown')
+            
+            # 更新统计
+            deadletter_stats['total_deadletters'] += 1
+            deadletter_stats['by_event_type'][event_type] = deadletter_stats['by_event_type'].get(event_type, 0) + 1
+            deadletter_stats['by_failure_reason'][failure_reason] = deadletter_stats['by_failure_reason'].get(failure_reason, 0) + 1
+            
+            # 详细日志记录
+            logger.error(f"💀 DEADLETTER EVENT RECEIVED:")
+            logger.error(f"   Event ID: {event_id}")
+            logger.error(f"   Event Type: {event_type}")
+            logger.error(f"   Source: {event_source}")
+            logger.error(f"   Failure Reason: {failure_reason}")
+            logger.error(f"   Original Destination: {original_destination}")
+            logger.error(f"   Headers: {json.dumps(headers, indent=2)}")
+            logger.error(f"   Data: {json.dumps(event_data, indent=2)}")
+            logger.error(f"   Timestamp: {datetime.utcnow().isoformat()}")
+            
+            # 根据事件类型和失败原因采取不同的处理策略
+            action_taken = process_deadletter_by_type(event_type, event_data, failure_reason)
+            
+            logger.info(f"✅ Deadletter processed with action: {action_taken}")
+            
+            return jsonify({
+                'status': 'processed',
+                'event_id': event_id,
+                'event_type': event_type,
+                'action_taken': action_taken,
+                'processed_at': datetime.utcnow().isoformat()
+            }), 200
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing deadletter: {str(e)}")
+            return jsonify({
+                'status': 'error',
+                'error': str(e)
+            }), 500
+    
+    def process_deadletter_by_type(event_type, event_data, failure_reason):
+        """
+        根据事件类型和失败原因采取不同的处理策略
+        """
+        actions = []
+        
+        # 1. 关键事件的特殊处理
+        if event_type in ['order.placed', 'payment.processed']:
+            actions.append('sent_alert_to_ops_team')
+            actions.append('logged_to_critical_errors')
+            
+            # 模拟发送告警
+            logger.warning(f"🚨 CRITICAL EVENT FAILED: {event_type} - {event_data.get('data', {})}")
+        
+        # 2. 根据失败原因采取行动
+        if failure_reason == 'destination_not_found':
+            actions.append('checked_service_availability')
+        elif failure_reason == 'timeout':
+            actions.append('analyzed_performance_issue')
+        elif failure_reason == 'invalid_response':
+            actions.append('validated_consumer_logic')
+        
+        # 3. 数据保存和分析
+        actions.append('saved_to_deadletter_storage')
+        actions.append('updated_failure_metrics')
+        
+        # 4. 可选：尝试重新路由到备用处理器
+        if should_retry_with_fallback(event_type, failure_reason):
+            actions.append('routed_to_fallback_processor')
+        
+        return actions
+    
+    def should_retry_with_fallback(event_type, failure_reason):
+        """
+        判断是否应该尝试备用处理器
+        """
+        # 对于某些类型的失败，可以尝试备用处理
+        retry_conditions = [
+            failure_reason in ['timeout', 'service_unavailable'],
+            event_type in ['user.created', 'order.placed']
+        ]
+        return any(retry_conditions)
+    
+    @app.route('/health', methods=['GET'])
+    def health_check():
+        """健康检查"""
+        uptime = time.time() - deadletter_stats['start_time']
+        return jsonify({
+            'status': 'healthy',
+            'service': 'deadletter-handler',
+            'uptime_seconds': round(uptime, 2),
+            'total_deadletters_processed': deadletter_stats['total_deadletters']
+        })
+    
+    @app.route('/stats', methods=['GET'])
+    def get_stats():
+        """死信统计信息"""
+        uptime = time.time() - deadletter_stats['start_time']
+        return jsonify({
+            'service_info': {
+                'name': 'deadletter-handler',
+                'purpose': 'Process failed events and take corrective actions'
+            },
+            'statistics': {
+                'total_deadletters': deadletter_stats['total_deadletters'],
+                'deadletters_per_hour': round((deadletter_stats['total_deadletters'] / max(uptime / 3600, 1)), 2),
+                'uptime_hours': round(uptime / 3600, 2)
+            },
+            'breakdown': {
+                'by_event_type': deadletter_stats['by_event_type'],
+                'by_failure_reason': deadletter_stats['by_failure_reason']
+            },
+            'recommendations': generate_recommendations()
+        })
+    
+    def generate_recommendations():
+        """基于失败模式生成改进建议"""
+        recommendations = []
+        
+        # 分析最常见的失败原因
+        if deadletter_stats['by_failure_reason'].get('timeout', 0) > 5:
+            recommendations.append("Consider increasing consumer timeout settings")
+        
+        if deadletter_stats['by_failure_reason'].get('destination_not_found', 0) > 3:
+            recommendations.append("Check consumer service availability and scaling")
+        
+        if deadletter_stats['total_deadletters'] > 50:
+            recommendations.append("High deadletter volume detected - review consumer error handling")
+        
+        return recommendations if recommendations else ["System operating normally"]
+    
+    if __name__ == "__main__":
+        logger.info("🚀 Starting Deadletter Handler Service...")
+        logger.info("💀 Ready to process failed events")
+        app.run(host='0.0.0.0', port=8080, debug=False)
+
+---
+# 5. 死信处理器部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deadletter-handler
+  namespace: knative-deadletter-demo
+spec:
+  replicas: 2  # 高可用
+  selector:
+    matchLabels:
+      app: deadletter-handler
+  template:
+    metadata:
+      labels:
+        app: deadletter-handler
+    spec:
+      containers:
+      - name: handler
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: handler-code
+          mountPath: /app
+        workingDir: /app
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install flask > /dev/null 2>&1
+          python main.py
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: handler-code
+        configMap:
+          name: deadletter-handler-code
+          defaultMode: 0755
+
+---
+# 6. 死信处理器服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: deadletter-handler-service
+  namespace: knative-deadletter-demo
+spec:
+  selector:
+    app: deadletter-handler
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# 7. 主要消费者（可能失败的服务）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unreliable-consumer
+  namespace: knative-deadletter-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unreliable-consumer
+  template:
+    metadata:
+      labels:
+        app: unreliable-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8080
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          pip install flask > /dev/null 2>&1
+          python3 -c "
+          from flask import Flask, request, jsonify
+          import random, time
+          
+          app = Flask(__name__)
+          processed = 0
+          
+          @app.route('/', methods=['POST'])
+          def handle_event():
+              global processed
+              processed += 1
+              
+              # 模拟 30% 的失败率
+              if random.random() < 0.3:
+                  print(f'❌ [Consumer] Event {processed} failed - simulating error')
+                  return jsonify({'error': 'Simulated failure'}), 500
+              
+              print(f'✅ [Consumer] Event {processed} processed successfully')
+              return jsonify({'status': 'success'}), 200
+          
+          app.run(host='0.0.0.0', port=8080)
+          "
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: unreliable-consumer-service
+  namespace: knative-deadletter-demo
+spec:
+  selector:
+    app: unreliable-consumer
+  ports:
+  - port: 80
+    targetPort: 8080
+
+---
+# 8. 主 Trigger - 带死信配置
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: main-trigger
+  namespace: knative-deadletter-demo
+spec:
+  broker: main-broker
+  filter:
+    attributes:
+      type: user.created
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: unreliable-consumer-service
+    uri: /
+  delivery:
+    retry: 3                    # 重试 3 次
+    backoffPolicy: exponential  # 指数退避
+    backoffDelay: PT1S         # 初始延迟 1 秒
+    deadLetterSink:            # 死信目标
+      ref:
+        apiVersion: eventing.knative.dev/v1
+        kind: Broker
+        name: deadletter-broker
+
+---
+# 9. 死信 Trigger - 处理死信事件
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: deadletter-trigger
+  namespace: knative-deadletter-demo
+spec:
+  broker: deadletter-broker
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: deadletter-handler-service
+    uri: /
+
+---
+# 10. 事件生产者
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-producer
+  namespace: knative-deadletter-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+    spec:
+      containers:
+      - name: producer
+        image: python:3.11-slim
+        env:
+        - name: BROKER_URL
+          value: "http://broker-ingress.knative-eventing.svc.cluster.local/knative-deadletter-demo/main-broker"
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          pip install requests > /dev/null 2>&1
+          python3 -c "
+          import requests, json, time, uuid
+          from datetime import datetime
+          
+          broker_url = '$BROKER_URL'
+          counter = 0
+          
+          while True:
+              counter += 1
+              event = {
+                  'specversion': '1.0',
+                  'type': 'user.created',
+                  'source': 'deadletter-demo-producer',
+                  'id': str(uuid.uuid4()),
+                  'time': datetime.utcnow().isoformat() + 'Z',
+                  'data': {'message': f'Test event #{counter}', 'counter': counter}
+              }
+              
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Ce-Specversion': '1.0',
+                  'Ce-Type': 'user.created',
+                  'Ce-Source': 'deadletter-demo-producer',
+                  'Ce-Id': event['id']
+              }
+              
+              try:
+                  response = requests.post(broker_url, json=event['data'], headers=headers)
+                  print(f'✅ Sent event #{counter}: {response.status_code}')
+              except Exception as e:
+                  print(f'❌ Error: {e}')
+              
+              time.sleep(3)
+          " 

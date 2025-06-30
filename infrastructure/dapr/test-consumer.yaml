@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dapr-test-consumer
+  namespace: dapr-demo
+spec:
+  replicas: 2  # 部署2个实例测试负载均衡
+  selector:
+    matchLabels:
+      app: test-consumer
+  template:
+    metadata:
+      labels:
+        app: test-consumer
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "test-consumer"
+        dapr.io/app-port: "8080"
+    spec:
+      containers:
+      - name: consumer
+        image: nginx:alpine
+        ports:
+        - containerPort: 8080
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          # 创建消费者脚本
+          cat > /tmp/test-consumer.sh << 'EOF'
+          #!/bin/sh
+          
+          # 获取Pod名称用于标识
+          HOSTNAME=$(hostname)
+          
+          echo "Starting Dapr test consumer on $HOSTNAME..."
+          
+          # 启动HTTP服务器处理Dapr的订阅请求
+          while true; do
+            # 使用netcat监听端口8080
+            {
+              read -r request_line
+              read -r host_header
+              
+              # 读取Content-Length
+              content_length=0
+              while IFS= read -r header && [ "$header" != $'\r' ]; do
+                if echo "$header" | grep -qi "Content-Length:"; then
+                  content_length=$(echo "$header" | cut -d' ' -f2 | tr -d '\r')
+                fi
+              done
+              
+              # 读取请求体
+              if [ "$content_length" -gt 0 ]; then
+                body=$(head -c "$content_length")
+              else
+                body=""
+              fi
+              
+              # 检查是否是订阅请求
+              if echo "$request_line" | grep -q "GET /dapr/subscribe"; then
+                # 返回订阅配置
+                echo "HTTP/1.1 200 OK"
+                echo "Content-Type: application/json"
+                echo "Content-Length: 131"
+                echo ""
+                echo '[{"pubsubname":"pubsub","topic":"pod-events","route":"/pod-events","metadata":{"rawPayload":"false"}}]'
+              elif echo "$request_line" | grep -q "POST /pod-events"; then
+                # 处理消息
+                echo "🔥 [$HOSTNAME] Received message: $body"
+                
+                # 解析JSON (简单方式)
+                message=$(echo "$body" | grep -o '"message":"[^"]*"' | cut -d'"' -f4)
+                timestamp=$(echo "$body" | grep -o '"timestamp":"[^"]*"' | cut -d'"' -f4)
+                
+                echo "📋 [$HOSTNAME] Message: $message"
+                echo "⏰ [$HOSTNAME] Timestamp: $timestamp"
+                
+                # 返回成功响应
+                echo "HTTP/1.1 200 OK"
+                echo "Content-Type: application/json"
+                echo "Content-Length: 27"
+                echo ""
+                echo '{"status":"success"}'
+              elif echo "$request_line" | grep -q "GET /health"; then
+                # 健康检查
+                echo "HTTP/1.1 200 OK"
+                echo "Content-Type: application/json"
+                echo "Content-Length: 22"
+                echo ""
+                echo '{"status":"healthy"}'
+              else
+                # 默认响应
+                echo "HTTP/1.1 200 OK"
+                echo "Content-Type: text/plain"
+                echo "Content-Length: 12"
+                echo ""
+                echo "Hello World!"
+              fi
+            } | nc -l -p 8080
+          done
+          EOF
+          
+          chmod +x /tmp/test-consumer.sh
+          /tmp/test-consumer.sh
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-consumer-service
+  namespace: default
+spec:
+  selector:
+    app: test-consumer
+  ports:
+  - port: 8080
+    targetPort: 8080 

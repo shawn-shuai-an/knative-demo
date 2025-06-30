@@ -1,0 +1,223 @@
+# Knative Demo 迁移到 Kafka 完整指南
+
+# ==========================================
+# 当前架构 (InMemoryChannel)
+# ==========================================
+
+current-architecture: |
+  Producer → Broker (InMemory) → InMemoryChannel → Trigger (类型过滤) → Consumer
+  
+  所有事件类型 (demo.event, user.created, order.placed) 
+  → 同一个 InMemoryChannel 
+  → 根据 event.type 过滤分发
+
+# ==========================================
+# 迁移到 Kafka 的 Topic 策略对比
+# ==========================================
+
+---
+# 策略1: 单 Topic 策略 (推荐，与现有架构一致)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-single-topic-config
+  namespace: knative-eventing
+data:
+  # 所有事件类型共用一个 Topic
+  default-topic-config: |
+    # Topic 名称：knative-broker-default
+    # 分区数：10 (支持并行处理)
+    # 副本数：3 (高可用)
+    
+    # 事件路由方式：
+    # 1. 所有事件类型写入同一个 Topic
+    # 2. Trigger 基于 CloudEvent 属性 (type) 过滤
+    # 3. 无需为每个 Trigger 配置单独 Topic
+
+single-topic-architecture: |
+  Producer → Kafka Broker → Single Topic (knative-broker-default)
+                              ↓
+                         所有事件类型混合存储
+                              ↓
+                    Trigger 基于 event.type 过滤:
+                    ├── demo.event → Consumer
+                    ├── user.created → Consumer  
+                    └── order.placed → Consumer
+
+---
+# 策略2: 多 Topic 策略 (可选，更细粒度控制)
+multi-topic-config: |
+  # 为每个事件类型创建单独 Topic
+  # Topic 命名：knative-broker-{event-type}
+  #   - knative-broker-demo-event
+  #   - knative-broker-user-created
+  #   - knative-broker-order-placed
+
+multi-topic-architecture: |
+  Producer → Kafka Broker → Multiple Topics:
+                            ├── demo.event → Topic-1 → Trigger-1 → Consumer
+                            ├── user.created → Topic-2 → Trigger-2 → Consumer
+                            └── order.placed → Topic-3 → Trigger-3 → Consumer
+
+# ==========================================
+# 迁移方案1: MTChannelBasedBroker + KafkaChannel
+# ==========================================
+
+---
+# 1.1 安装 Kafka (选择 Bitnami Helm - 最简单)
+kafka-installation: |
+  # 安装命令:
+  helm repo add bitnami https://charts.bitnami.com/bitnami
+  helm install kafka bitnami/kafka \
+    --set replicaCount=3 \
+    --set persistence.enabled=true \
+    --set persistence.size=10Gi \
+    --set zookeeper.persistence.enabled=true \
+    --set zookeeper.persistence.size=5Gi
+
+---
+# 1.2 配置 KafkaChannel 为默认 Channel
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-br-default-channel
+  namespace: knative-eventing
+data:
+  channel-template-spec: |
+    apiVersion: messaging.knative.dev/v1beta1
+    kind: KafkaChannel
+    spec:
+      numPartitions: 10
+      replicationFactor: 3
+      retentionDuration: P7D  # 7天保留期
+
+---
+# 1.3 创建 Kafka 连接配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-kafka
+  namespace: knative-eventing
+data:
+  bootstrapServers: "kafka.default.svc.cluster.local:9092"
+
+---
+# 1.4 你的 Trigger 保持不变！
+existing-triggers-unchanged: |
+  # ✅ demo-event-trigger     - filter: type=demo.event
+  # ✅ user-created-trigger   - filter: type=user.created  
+  # ✅ order-placed-trigger   - filter: type=order.placed
+  #
+  # 无需修改！Kafka 迁移对 Trigger 透明
+
+# ==========================================
+# 迁移方案2: Native Kafka Broker (推荐生产)
+# ==========================================
+
+---
+# 2.1 安装 Knative Kafka Broker
+kafka-broker-installation: |
+  # 安装 Knative Kafka 扩展:
+  kubectl apply -f https://github.com/knative-extensions/eventing-kafka-broker/releases/latest/download/eventing-kafka-controller.yaml
+  kubectl apply -f https://github.com/knative-extensions/eventing-kafka-broker/releases/latest/download/eventing-kafka-broker.yaml
+
+---
+# 2.2 创建 Native Kafka Broker 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-broker-config
+  namespace: knative-eventing
+data:
+  bootstrap.servers: "kafka.default.svc.cluster.local:9092"
+  # 单 Topic 策略配置
+  default.topic.partitions: "10"
+  default.topic.replication.factor: "3"
+  default.topic.retention.ms: "604800000"  # 7天
+
+---
+# 2.3 创建或修改现有 Broker
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: kafka-broker  # 新建，或替换现有的 default
+  namespace: knative-demo
+  annotations:
+    eventing.knative.dev/broker.class: Kafka  # 关键：使用 Kafka Broker
+spec:
+  config:
+    apiVersion: v1
+    kind: ConfigMap
+    name: kafka-broker-config
+    namespace: knative-eventing
+
+---
+# 2.4 更新 Trigger 指向新 Broker (如果新建了 kafka-broker)
+trigger-update-example: |
+  # 选项A: 修改现有 Broker 为 Kafka 类型
+  kubectl patch broker default -n knative-demo \
+    --type='merge' \
+    -p='{"metadata":{"annotations":{"eventing.knative.dev/broker.class":"Kafka"}}}'
+  
+  # 选项B: 更新 Trigger 指向新 Broker
+  kubectl patch trigger demo-event-trigger -n knative-demo \
+    --type='merge' \
+    -p='{"spec":{"broker":"kafka-broker"}}'
+
+# ==========================================
+# 迁移步骤总结
+# ==========================================
+
+migration-steps: |
+  
+  📋 完整迁移清单:
+  
+  □ 步骤1: 安装 Kafka 集群
+     ├── helm install kafka bitnami/kafka
+     └── 验证: kubectl get pods -l app.kubernetes.io/name=kafka
+  
+  □ 步骤2: 安装 Knative Kafka 组件  
+     ├── kubectl apply -f eventing-kafka-controller.yaml
+     └── kubectl apply -f eventing-kafka-broker.yaml
+  
+  □ 步骤3: 选择迁移策略
+     ├── 方案A: 修改现有 Broker 类型 (零停机)
+     └── 方案B: 创建新 Kafka Broker (并行测试)
+  
+  □ 步骤4: 验证事件流
+     ├── 检查 Producer 仍在发送事件
+     ├── 检查 Consumer 仍在接收事件  
+     └── 检查 Kafka Topic 已创建并有数据
+  
+  □ 步骤5: 清理旧资源 (可选)
+     └── 删除旧的 InMemoryChannel
+
+# ==========================================
+# Topic 自动创建验证
+# ==========================================
+
+verify-topics: |
+  # 检查自动创建的 Topic:
+  kubectl exec -it kafka-0 -- kafka-topics.sh \
+    --bootstrap-server localhost:9092 \
+    --list
+  
+  # 预期看到:
+  # knative-broker-knative-demo-default (单 Topic 策略)
+  # 或
+  # knative-broker-knative-demo-default-demo-event
+  # knative-broker-knative-demo-default-user-created  
+  # knative-broker-knative-demo-default-order-placed (多 Topic 策略)
+
+---
+# 关键收益对比
+benefits-comparison: |
+  
+  | 特性                | InMemoryChannel | KafkaChannel      |
+  |--------------------|-----------------|-------------------|
+  | **持久化**          | ❌ 重启丢失      | ✅ 持久化存储      |
+  | **事件回放**        | ❌ 不支持        | ✅ 支持 7 天回放   |
+  | **高可用**          | ❌ 单点故障      | ✅ 3 副本集群      |
+  | **扩容能力**        | 🟡 内存限制      | 🚀 水平扩展       |
+  | **监控能力**        | 🟡 基础监控      | 🚀 丰富监控       |
+  | **Trigger 配置**   | ✅ 无需改动      | ✅ 无需改动       | 

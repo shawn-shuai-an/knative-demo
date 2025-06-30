@@ -1,0 +1,59 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub-with-retry
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  # === 基础连接配置 ===
+  - name: redisHost
+    value: "172.22.131.59:6379"
+  - name: redisPassword
+    value: ""
+  - name: redisDB
+    value: "2"
+    
+  # === 重试机制配置 ===
+  - name: maxRetries
+    value: "5"                    # 最大重试次数
+  - name: maxRetryBackoff
+    value: "60s"                  # 最大重试间隔
+  - name: enableDeadLetter
+    value: "true"                 # 启用死信队列
+  - name: deadLetterTopic
+    value: "deadletter-topic"     # 死信Topic名称
+    
+  # === Redis Streams 特定配置 ===
+  - name: processingTimeout
+    value: "30s"                  # 消息处理超时时间
+  - name: redeliverInterval
+    value: "60s"                  # 重新投递间隔
+  - name: maxLenApprox
+    value: "true"                 # 使用近似长度限制
+  - name: maxLen
+    value: "10000"                # Stream最大长度
+    
+  # === 性能和并发控制 ===
+  - name: concurrency
+    value: "10"                   # 并发消费者数量
+  - name: consumerID
+    value: "consumer-instance-1"  # 消费者实例ID
+---
+# 死信队列处理组件（可选）
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: deadletter-handler
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: "172.22.131.59:6379"
+  - name: redisDB
+    value: "3"                    # 使用不同的DB存储死信
+  - name: enableDeadLetter
+    value: "false"                # 死信处理器不再重试 

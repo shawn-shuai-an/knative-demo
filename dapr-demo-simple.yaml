@@ -1,0 +1,240 @@
+# Dapr 事件驱动架构演示
+# 架构：Producer → Dapr Sidecar → Pub/Sub Component → Dapr Sidecar → Consumer
+
+---
+# 1. 命名空间
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dapr-demo
+
+---
+# 2. Pub/Sub Component - 消息队列组件
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: "redis-master.default.svc.cluster.local:6379"
+  - name: redisPassword
+    value: ""
+  - name: redisDB
+    value: "0"
+  # 可选：配置 Kafka 后端
+  # type: pubsub.kafka
+  # metadata:
+  # - name: brokers
+  #   value: "kafka.default.svc.cluster.local:9092"
+  # - name: consumerGroup
+  #   value: "dapr-consumer-group"
+
+---
+# 3. 事件生产者
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-producer
+  namespace: dapr-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "event-producer"
+        dapr.io/app-port: "6000"
+    spec:
+      containers:
+      - name: producer
+        image: python:3.11-slim
+        ports:
+        - containerPort: 6000
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          pip install requests > /dev/null 2>&1
+          python3 -c "
+          import requests, json, time, uuid
+          from datetime import datetime
+          
+          dapr_url = 'http://localhost:3500'  # Dapr sidecar
+          pubsub_name = 'pubsub'
+          topics = ['user.created', 'order.placed', 'payment.processed']
+          
+          while True:
+              topic = topics[int(time.time()) % len(topics)]
+              event_data = {
+                  'id': str(uuid.uuid4()),
+                  'source': 'dapr-producer',
+                  'type': topic,
+                  'time': datetime.utcnow().isoformat() + 'Z',
+                  'data': {'message': f'Hello from {topic}', 'timestamp': time.time()}
+              }
+              
+              try:
+                  # 发布到 Dapr Pub/Sub
+                  url = f'{dapr_url}/v1.0/publish/{pubsub_name}/{topic}'
+                  response = requests.post(url, json=event_data)
+                  print(f'✅ Published {topic}: {response.status_code}')
+              except Exception as e:
+                  print(f'❌ Error: {e}')
+              
+              time.sleep(5)
+          "
+
+---
+# 4. 事件消费者
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-consumer
+  namespace: dapr-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: consumer
+  template:
+    metadata:
+      labels:
+        app: consumer
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "event-consumer"
+        dapr.io/app-port: "6001"
+    spec:
+      containers:
+      - name: consumer
+        image: python:3.11-slim
+        ports:
+        - containerPort: 6001
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          pip install flask > /dev/null 2>&1
+          python3 -c "
+          from flask import Flask, request, jsonify
+          import json, time
+          
+          app = Flask(__name__)
+          processed_count = 0
+          
+          # Dapr 订阅配置端点
+          @app.route('/dapr/subscribe', methods=['GET'])
+          def subscribe():
+              subscriptions = [
+                  {'pubsubname': 'pubsub', 'topic': 'user.created', 'route': '/user-events'},
+                  {'pubsubname': 'pubsub', 'topic': 'order.placed', 'route': '/order-events'},
+                  {'pubsubname': 'pubsub', 'topic': 'payment.processed', 'route': '/payment-events'}
+              ]
+              return jsonify(subscriptions)
+          
+          # 处理用户事件
+          @app.route('/user-events', methods=['POST'])
+          def handle_user_events():
+              return process_event('user.created')
+          
+          # 处理订单事件
+          @app.route('/order-events', methods=['POST'])
+          def handle_order_events():
+              return process_event('order.placed')
+          
+          # 处理支付事件
+          @app.route('/payment-events', methods=['POST'])
+          def handle_payment_events():
+              return process_event('payment.processed')
+          
+          def process_event(event_type):
+              global processed_count
+              processed_count += 1
+              
+              # 获取事件数据
+              data = request.get_json() or {}
+              
+              print(f'🎯 [{processed_count}] Received {event_type}')
+              print(f'   Event ID: {data.get(\"id\", \"unknown\")}')
+              print(f'   Data: {data.get(\"data\", {})}')
+              
+              # 模拟处理时间
+              time.sleep(0.1)
+              
+              return jsonify({'status': 'SUCCESS'}), 200
+          
+          @app.route('/health', methods=['GET'])
+          def health():
+              return jsonify({'status': 'healthy', 'processed': processed_count})
+          
+          print('🚀 Consumer started on port 6001')
+          app.run(host='0.0.0.0', port=6001)
+          "
+
+---
+# 5. 消费者服务（可选，用于健康检查）
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-consumer-service
+  namespace: dapr-demo
+spec:
+  selector:
+    app: consumer
+  ports:
+  - port: 80
+    targetPort: 6001
+  type: ClusterIP
+
+---
+# 6. Redis 部署 (如果使用 Redis)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        args: ["redis-server", "--appendonly", "yes"]
+        volumeMounts:
+        - name: redis-storage
+          mountPath: /data
+      volumes:
+      - name: redis-storage
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: default
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+  type: ClusterIP 

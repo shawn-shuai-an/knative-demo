@@ -1,0 +1,470 @@
+# Dapr 完整事件驱动架构演示
+# 架构：Producer (SDK) → Dapr Sidecar → Pub/Sub Component → Dapr Sidecar → Consumer
+
+---
+# 1. 命名空间
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dapr-demo
+
+---
+# 2. Pub/Sub Component - 消息队列组件
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: "redis-master.default.svc.cluster.local:6379"
+  - name: redisPassword
+    value: ""
+  - name: redisDB
+    value: "0"
+
+---
+# 3. Producer ConfigMap - 使用 Dapr SDK
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: producer-code
+  namespace: dapr-demo
+data:
+  main.py: |
+    #!/usr/bin/env python3
+    """
+    Dapr Producer 使用 SDK 版本
+    自动处理与 sidecar 的通信，无需指定 localhost
+    """
+    
+    import time
+    import json
+    import uuid
+    import asyncio
+    from datetime import datetime
+    from dapr.clients import DaprClient
+    
+    # Pub/Sub 配置
+    PUBSUB_NAME = "pubsub"
+    TOPICS = ["user.created", "order.placed", "payment.processed"]
+    
+    def create_event_data(topic):
+        """创建事件数据"""
+        return {
+            "id": str(uuid.uuid4()),
+            "source": "dapr-producer-sdk",
+            "type": topic,
+            "time": datetime.utcnow().isoformat() + "Z",
+            "data": {
+                "message": f"Hello from {topic}",
+                "timestamp": time.time(),
+                "producer": "dapr-sdk-version"
+            }
+        }
+    
+    def main():
+        print("🚀 Starting Dapr Producer with SDK...")
+        print(f"📋 Publishing to topics: {TOPICS}")
+        
+        # 使用 Dapr Client SDK - 自动发现 sidecar
+        with DaprClient() as dapr_client:
+            counter = 0
+            
+            while True:
+                try:
+                    # 轮流发送不同类型的事件
+                    topic = TOPICS[counter % len(TOPICS)]
+                    event_data = create_event_data(topic)
+                    
+                    # 使用 SDK 发布事件 - 无需指定 localhost:3500
+                    dapr_client.publish_event(
+                        pubsub_name=PUBSUB_NAME,
+                        topic_name=topic,
+                        data=json.dumps(event_data),
+                        data_content_type="application/json"
+                    )
+                    
+                    counter += 1
+                    print(f"✅ [SDK] Published {topic} (#{counter}): {event_data['id']}")
+                    
+                except Exception as e:
+                    print(f"❌ [SDK] Error publishing event: {e}")
+                
+                time.sleep(5)
+    
+    if __name__ == "__main__":
+        main()
+
+  requirements.txt: |
+    dapr
+    dapr-ext-grpc
+
+---
+# 4. 事件生产者 Deployment - 使用 SDK
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-producer
+  namespace: dapr-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "event-producer"
+        dapr.io/app-port: "6000"
+    spec:
+      containers:
+      - name: producer
+        image: python:3.11-slim
+        ports:
+        - containerPort: 6000
+        volumeMounts:
+        - name: producer-code
+          mountPath: /app
+        workingDir: /app
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          echo "📦 Installing Dapr SDK..."
+          pip install -r requirements.txt > /dev/null 2>&1
+          echo "🚀 Starting Producer with Dapr SDK..."
+          python main.py
+      volumes:
+      - name: producer-code
+        configMap:
+          name: producer-code
+          defaultMode: 0755
+
+---
+# 5. Consumer ConfigMap - 完整的消费者代码
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: consumer-code
+  namespace: dapr-demo
+data:
+  main.py: |
+    #!/usr/bin/env python3
+    """
+    Dapr Consumer 完整实现
+    处理来自不同 Topic 的事件
+    """
+    
+    import json
+    import time
+    import threading
+    from datetime import datetime
+    from flask import Flask, request, jsonify
+    
+    app = Flask(__name__)
+    
+    # 统计信息
+    stats = {
+        'total_processed': 0,
+        'by_topic': {},
+        'start_time': time.time(),
+        'last_event_time': None
+    }
+    stats_lock = threading.Lock()
+    
+    def update_stats(topic):
+        """更新统计信息"""
+        with stats_lock:
+            stats['total_processed'] += 1
+            stats['by_topic'][topic] = stats['by_topic'].get(topic, 0) + 1
+            stats['last_event_time'] = datetime.utcnow().isoformat()
+    
+    def log_event(topic, event_data, request_headers):
+        """记录事件信息"""
+        event_id = event_data.get('id', 'unknown')
+        event_source = event_data.get('source', 'unknown')
+        
+        print(f"🎯 [{stats['total_processed']}] Received {topic}")
+        print(f"   Event ID: {event_id}")
+        print(f"   Source: {event_source}")
+        print(f"   Data: {event_data.get('data', {})}")
+        print(f"   Headers: {dict(request.headers)}")
+        print(f"   Timestamp: {datetime.utcnow().isoformat()}")
+        print("   " + "="*50)
+    
+    @app.route('/dapr/subscribe', methods=['GET'])
+    def subscribe():
+        """
+        Dapr 订阅配置端点
+        定义应用要订阅的 Topic 和对应的路由
+        """
+        subscriptions = [
+            {
+                "pubsubname": "pubsub",
+                "topic": "user.created",
+                "route": "/user-events",
+                "metadata": {
+                    "consumerGroup": "user-processors"
+                }
+            },
+            {
+                "pubsubname": "pubsub", 
+                "topic": "order.placed",
+                "route": "/order-events",
+                "metadata": {
+                    "consumerGroup": "order-processors"
+                }
+            },
+            {
+                "pubsubname": "pubsub",
+                "topic": "payment.processed", 
+                "route": "/payment-events",
+                "metadata": {
+                    "consumerGroup": "payment-processors"
+                }
+            }
+        ]
+        
+        print(f"📋 Dapr requesting subscriptions, returning {len(subscriptions)} topics")
+        return jsonify(subscriptions)
+    
+    @app.route('/user-events', methods=['POST'])
+    def handle_user_events():
+        """处理用户相关事件"""
+        return process_event('user.created')
+    
+    @app.route('/order-events', methods=['POST'])
+    def handle_order_events():
+        """处理订单相关事件"""
+        return process_event('order.placed')
+    
+    @app.route('/payment-events', methods=['POST'])
+    def handle_payment_events():
+        """处理支付相关事件"""
+        return process_event('payment.processed')
+    
+    def process_event(event_type):
+        """通用事件处理逻辑"""
+        try:
+            # 获取事件数据
+            event_data = request.get_json() or {}
+            
+            # 更新统计
+            update_stats(event_type)
+            
+            # 记录事件
+            log_event(event_type, event_data, request.headers)
+            
+            # 模拟业务处理时间
+            processing_time = 0.1
+            if event_type == 'order.placed':
+                processing_time = 0.2  # 订单处理更复杂
+            elif event_type == 'payment.processed':
+                processing_time = 0.15  # 支付处理中等复杂
+            
+            time.sleep(processing_time)
+            
+            # 返回成功响应（Dapr 期望的格式）
+            return jsonify({
+                "status": "SUCCESS",
+                "message": f"Processed {event_type}",
+                "event_id": event_data.get('id', 'unknown'),
+                "processed_at": datetime.utcnow().isoformat()
+            }), 200
+            
+        except Exception as e:
+            print(f"❌ Error processing {event_type}: {str(e)}")
+            # 返回错误，Dapr 会重试
+            return jsonify({
+                "status": "RETRY", 
+                "error": str(e)
+            }), 500
+    
+    @app.route('/health', methods=['GET'])
+    def health_check():
+        """健康检查端点"""
+        uptime = time.time() - stats['start_time']
+        
+        with stats_lock:
+            current_stats = dict(stats)
+        
+        return jsonify({
+            "status": "healthy",
+            "service": "dapr-consumer",
+            "uptime_seconds": round(uptime, 2),
+            "total_processed": current_stats['total_processed'],
+            "by_topic": current_stats['by_topic'],
+            "last_event_time": current_stats['last_event_time'],
+            "events_per_minute": round((current_stats['total_processed'] / max(uptime / 60, 1)), 2)
+        })
+    
+    @app.route('/stats', methods=['GET'])
+    def detailed_stats():
+        """详细统计信息"""
+        uptime = time.time() - stats['start_time']
+        
+        with stats_lock:
+            current_stats = dict(stats)
+        
+        return jsonify({
+            "service_info": {
+                "name": "dapr-consumer",
+                "version": "1.0.0",
+                "framework": "dapr + flask"
+            },
+            "runtime_stats": {
+                "uptime_seconds": round(uptime, 2),
+                "total_events_processed": current_stats['total_processed'],
+                "events_per_second": round(current_stats['total_processed'] / max(uptime, 1), 2),
+                "last_event_time": current_stats['last_event_time']
+            },
+            "topic_breakdown": current_stats['by_topic'],
+            "subscriptions": [
+                "user.created → /user-events",
+                "order.placed → /order-events", 
+                "payment.processed → /payment-events"
+            ]
+        })
+    
+    if __name__ == "__main__":
+        print("🚀 Starting Dapr Consumer Service...")
+        print("📋 Subscribing to topics: user.created, order.placed, payment.processed")
+        print("🌐 Serving on port 6001")
+        
+        app.run(host='0.0.0.0', port=6001, debug=False)
+
+  requirements.txt: |
+    flask
+
+---
+# 6. 事件消费者 Deployment - 完整配置
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-consumer
+  namespace: dapr-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: consumer
+  template:
+    metadata:
+      labels:
+        app: consumer
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "event-consumer"
+        dapr.io/app-port: "6001"
+    spec:
+      containers:
+      - name: consumer
+        image: python:3.11-slim
+        ports:
+        - containerPort: 6001
+        volumeMounts:
+        - name: consumer-code
+          mountPath: /app
+        workingDir: /app
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          echo "📦 Installing Flask..."
+          pip install -r requirements.txt > /dev/null 2>&1
+          echo "🚀 Starting Consumer..."
+          python main.py
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: consumer-code
+        configMap:
+          name: consumer-code
+          defaultMode: 0755
+
+---
+# 7. 消费者服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-consumer-service
+  namespace: dapr-demo
+spec:
+  selector:
+    app: consumer
+  ports:
+  - name: http
+    port: 80
+    targetPort: 6001
+    protocol: TCP
+  type: ClusterIP
+
+---
+# 8. Redis 部署
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        args: 
+        - redis-server
+        - --appendonly
+        - "yes"
+        - --appendfsync
+        - everysec
+        volumeMounts:
+        - name: redis-storage
+          mountPath: /data
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+      volumes:
+      - name: redis-storage
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-master
+  namespace: default
+spec:
+  selector:
+    app: redis
+  ports:
+  - name: redis
+    port: 6379
+    targetPort: 6379
+    protocol: TCP
+  type: ClusterIP 

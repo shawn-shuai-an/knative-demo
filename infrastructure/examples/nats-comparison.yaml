@@ -1,0 +1,118 @@
+# NATS vs Kafka vs InMemory 对比和配置示例
+
+---
+# 1. NATS 集群安装 (使用 NATS Operator)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nats-system
+
+---
+# NATS 集群配置
+apiVersion: nats.io/v1alpha2
+kind: NatsCluster
+metadata:
+  name: nats-cluster
+  namespace: nats-system
+spec:
+  size: 3
+  version: "2.9.23"
+  
+  # 持久化配置
+  pod:
+    enableConfigReload: true
+    reloader:
+      image: natsio/nats-server-config-reloader:0.7.0
+    natsContainer:
+      image: nats:2.9.23-alpine
+      
+  # NATS JetStream (持久化存储)
+  jetstream:
+    enabled: true
+    memStorage:
+      enabled: true
+      size: 1Gi
+    fileStorage:
+      enabled: true
+      size: 10Gi
+      storageClassName: standard
+
+---
+# 2. NatsChannel 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-br-nats-channel
+  namespace: knative-eventing
+data:
+  channel-template-spec: |
+    apiVersion: messaging.knative.dev/v1alpha1
+    kind: NatssChannel
+    spec:
+      # NATS 连接配置
+      natssConfig:
+        servers: "nats://nats-cluster:4222"
+        # 集群模式
+        cluster:
+          enabled: true
+          replicas: 3
+      # JetStream 持久化配置  
+      jetstream:
+        enabled: true
+        stream:
+          retention: "limits"
+          maxAge: "7d"
+          maxBytes: "1GB"
+          replicas: 3
+
+---
+# 3. 使用 NatsChannel 的 Broker
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: nats-broker
+  namespace: knative-demo
+  annotations:
+    eventing.knative.dev/broker.class: MTChannelBasedBroker
+spec:
+  config:
+    apiVersion: v1
+    kind: ConfigMap
+    name: config-br-nats-channel
+    namespace: knative-eventing
+  delivery:
+    retry: 3
+    backoffPolicy: exponential
+    backoffDelay: PT1S
+
+---
+# 消息系统特性对比表
+# 
+# | 特性              | InMemoryChannel | NatsChannel      | KafkaChannel    |
+# |-------------------|-----------------|------------------|-----------------|
+# | **安装复杂度**    | 🟢 无需安装      | 🟡 中等          | 🔴 复杂         |
+# | **运维复杂度**    | 🟢 零维护        | 🟡 轻量维护      | 🔴 重度维护     |
+# | **持久化**        | ❌ 无           | ✅ JetStream     | ✅ 完整         |
+# | **性能**          | 🚀 极快         | ⚡ 快            | ⚡ 高吞吐       |
+# | **内存占用**      | 🟢 很低          | 🟡 中等          | 🔴 较高         |
+# | **集群支持**      | ❌ 单节点        | ✅ 简单集群      | ✅ 完整集群     |
+# | **事件回放**      | ❌ 不支持        | ✅ 有限支持      | ✅ 完整支持     |
+# | **消息顺序**      | ✅ 单线程有序    | 🟡 主题内有序    | ✅ 分区内有序   |
+# | **云原生**        | ✅ 完美          | ✅ 很好          | 🟡 需要配置     |
+# | **学习成本**      | 🟢 零           | 🟡 低            | 🔴 高           |
+# | **社区生态**      | ➖ N/A          | 🟡 中等          | 🚀 丰富         |
+
+---
+# 4. NATS 安装脚本示例
+# 
+# # 安装 NATS Operator
+# kubectl apply -f https://github.com/nats-io/nats-operator/releases/latest/download/00-prereqs.yaml
+# kubectl apply -f https://github.com/nats-io/nats-operator/releases/latest/download/10-deployment.yaml
+# 
+# # 或者使用 Helm (推荐)
+# helm repo add nats https://nats-io.github.io/k8s/helm/charts/
+# helm install nats nats/nats
+# 
+# # 验证安装
+# kubectl get pods -n nats-system
+# kubectl get natsclusters -A 

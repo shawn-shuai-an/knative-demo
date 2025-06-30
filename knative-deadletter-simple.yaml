@@ -1,0 +1,288 @@
+# Knative 死信队列 - 简化演示版本
+# 快速理解核心概念
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: knative-simple-dl
+
+---
+# 主 Broker
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: main-broker
+  namespace: knative-simple-dl
+
+---
+# 死信 Broker
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: deadletter-broker
+  namespace: knative-simple-dl
+
+---
+# 不可靠的消费者（30%失败率）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: unreliable-consumer
+  namespace: knative-simple-dl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: unreliable-consumer
+  template:
+    metadata:
+      labels:
+        app: unreliable-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8080
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install flask requests > /dev/null 2>&1
+          python3 -c "
+          from flask import Flask, request, jsonify
+          import random, json
+          
+          app = Flask(__name__)
+          counter = 0
+          
+          @app.route('/', methods=['POST'])
+          def handle():
+              global counter
+              counter += 1
+              
+              headers = dict(request.headers)
+              event_type = headers.get('Ce-Type', 'unknown')
+              event_id = headers.get('Ce-Id', 'unknown')
+              
+              print(f'📥 [Consumer {counter}] Received: {event_type} - {event_id}')
+              
+              # 模拟 30% 失败率
+              if random.random() < 0.3:
+                  print(f'❌ [Consumer {counter}] FAILED - will go to deadletter')
+                  return jsonify({'error': 'Random failure'}), 500
+              
+              print(f'✅ [Consumer {counter}] SUCCESS')
+              return jsonify({'status': 'ok'}), 200
+          
+          print('🚀 Unreliable Consumer started (30% failure rate)')
+          app.run(host='0.0.0.0', port=8080)
+          "
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: unreliable-consumer
+  namespace: knative-simple-dl
+spec:
+  selector:
+    app: unreliable-consumer
+  ports:
+  - port: 80
+    targetPort: 8080
+
+---
+# 简单的死信处理器
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simple-deadletter-handler
+  namespace: knative-simple-dl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: simple-deadletter-handler
+  template:
+    metadata:
+      labels:
+        app: simple-deadletter-handler
+    spec:
+      containers:
+      - name: handler
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8080
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install flask > /dev/null 2>&1
+          python3 -c "
+          from flask import Flask, request, jsonify
+          import json
+          from datetime import datetime
+          
+          app = Flask(__name__)
+          deadletter_count = 0
+          
+          @app.route('/', methods=['POST'])
+          def handle_deadletter():
+              global deadletter_count
+              deadletter_count += 1
+              
+              headers = dict(request.headers)
+              event_type = headers.get('Ce-Type', 'unknown')
+              event_id = headers.get('Ce-Id', 'unknown')
+              failure_reason = headers.get('Ce-Knative-Error-Code', 'unknown')
+              
+              print(f'💀 [DeadLetter {deadletter_count}] RECEIVED FAILED EVENT:')
+              print(f'   📋 Event Type: {event_type}')
+              print(f'   🆔 Event ID: {event_id}') 
+              print(f'   ❌ Failure Reason: {failure_reason}')
+              print(f'   🕐 Time: {datetime.now().strftime(\"%H:%M:%S\")}')
+              print(f'   📊 Total DeadLetters: {deadletter_count}')
+              print('   ' + '='*50)
+              
+              return jsonify({
+                  'status': 'deadletter_processed',
+                  'count': deadletter_count,
+                  'event_id': event_id
+              }), 200
+          
+          @app.route('/stats', methods=['GET'])
+          def stats():
+              return jsonify({
+                  'total_deadletters': deadletter_count,
+                  'service': 'simple-deadletter-handler'
+              })
+          
+          print('💀 Simple DeadLetter Handler started')
+          print('📊 Visit /stats for statistics')
+          app.run(host='0.0.0.0', port=8080)
+          "
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: simple-deadletter-handler
+  namespace: knative-simple-dl
+spec:
+  selector:
+    app: simple-deadletter-handler
+  ports:
+  - port: 80
+    targetPort: 8080
+
+---
+# 主 Trigger（关键配置：包含死信设置）
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: main-trigger
+  namespace: knative-simple-dl
+spec:
+  broker: main-broker
+  filter:
+    attributes:
+      type: test.event
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: unreliable-consumer
+    uri: /
+  delivery:
+    retry: 2                    # 🔑 重试2次
+    backoffPolicy: exponential  # 🔑 指数退避
+    backoffDelay: PT1S          # 🔑 初始延迟1秒
+    deadLetterSink:             # 🔑 死信目标 - 关键配置！
+      ref:
+        apiVersion: eventing.knative.dev/v1
+        kind: Broker
+        name: deadletter-broker
+
+---
+# 死信 Trigger
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: deadletter-trigger
+  namespace: knative-simple-dl
+spec:
+  broker: deadletter-broker  # 监听死信 Broker
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: simple-deadletter-handler
+    uri: /
+
+---
+# 事件生产者
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-producer
+  namespace: knative-simple-dl
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+    spec:
+      containers:
+      - name: producer
+        image: python:3.11-slim
+        env:
+        - name: BROKER_URL
+          value: "http://broker-ingress.knative-eventing.svc.cluster.local/knative-simple-dl/main-broker"
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - |
+          pip install requests > /dev/null 2>&1
+          python3 -c "
+          import requests, json, time, uuid
+          from datetime import datetime
+          
+          broker_url = '$BROKER_URL'
+          counter = 0
+          
+          print('🚀 Producer started - sending events every 5 seconds')
+          print(f'📡 Target: {broker_url}')
+          print('='*60)
+          
+          while True:
+              counter += 1
+              event_id = str(uuid.uuid4())
+              
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Ce-Specversion': '1.0',
+                  'Ce-Type': 'test.event',
+                  'Ce-Source': 'simple-producer',
+                  'Ce-Id': event_id
+              }
+              
+              data = {
+                  'message': f'Test event #{counter}',
+                  'counter': counter,
+                  'timestamp': datetime.now().isoformat()
+              }
+              
+              try:
+                  response = requests.post(broker_url, json=data, headers=headers, timeout=5)
+                  print(f'📤 [Producer {counter}] Sent event: {response.status_code} - ID: {event_id[:8]}...')
+              except Exception as e:
+                  print(f'❌ [Producer {counter}] Error: {e}')
+              
+              time.sleep(5)  # 每5秒发送一个事件
+          " 

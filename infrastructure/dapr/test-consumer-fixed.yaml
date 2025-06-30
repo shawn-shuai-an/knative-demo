@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dapr-test-consumer-fixed
+  namespace: dapr-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: test-consumer-fixed
+  template:
+    metadata:
+      labels:
+        app: test-consumer-fixed
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "test-consumer-fixed"
+        dapr.io/app-port: "8080"
+    spec:
+      containers:
+      - name: consumer
+        image: nginx:alpine
+        ports:
+        - containerPort: 8080
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          # 安装必要的工具
+          apk add --no-cache jq
+          
+          # 创建修复版本的消费者
+          cat > /tmp/consumer-server.sh << 'EOF'
+          #!/bin/sh
+          
+          HOSTNAME=$(hostname)
+          echo "🚀 Starting Dapr consumer on $HOSTNAME..."
+          
+          # 创建临时文件用于通信
+          mkfifo /tmp/http_pipe
+          
+          while true; do
+            # 读取HTTP请求
+            (
+              # 读取请求行
+              read method path version < /tmp/http_pipe
+              echo "📥 [$HOSTNAME] Request: $method $path"
+              
+              # 读取headers
+              content_length=0
+              while IFS= read -r header && [ "$header" != $'\r' ]; do
+                if echo "$header" | grep -qi "Content-Length:"; then
+                  content_length=$(echo "$header" | sed 's/Content-Length: *//i' | tr -d '\r')
+                fi
+              done < /tmp/http_pipe
+              
+              # 读取body
+              if [ "$content_length" -gt 0 ]; then
+                body=$(head -c "$content_length" < /tmp/http_pipe)
+              else
+                body=""
+              fi
+              
+              # 路由处理
+              case "$path" in
+                "/dapr/subscribe")
+                  # 返回订阅配置
+                  response='[{"pubsubname":"pubsub","topic":"pod-events","route":"/pod-events"}]'
+                  echo "HTTP/1.1 200 OK"
+                  echo "Content-Type: application/json"
+                  echo "Content-Length: ${#response}"
+                  echo ""
+                  echo "$response"
+                  echo "✅ [$HOSTNAME] Subscription config sent"
+                  ;;
+                "/pod-events")
+                  # 处理事件消息
+                  echo "🔥 [$HOSTNAME] Received pod event: $body"
+                  
+                  # 提取消息内容
+                  if [ -n "$body" ]; then
+                    message=$(echo "$body" | jq -r '.data.message // .message // "unknown"' 2>/dev/null || echo "unknown")
+                    timestamp=$(echo "$body" | jq -r '.data.timestamp // .timestamp // "unknown"' 2>/dev/null || echo "unknown")
+                    echo "📋 [$HOSTNAME] Message: $message"
+                    echo "⏰ [$HOSTNAME] Timestamp: $timestamp"
+                  fi
+                  
+                  # 返回成功响应
+                  response='{"status":"success"}'
+                  echo "HTTP/1.1 200 OK"
+                  echo "Content-Type: application/json"
+                  echo "Content-Length: ${#response}"
+                  echo ""
+                  echo "$response"
+                  ;;
+                "/health")
+                  # 健康检查
+                  response='{"status":"healthy"}'
+                  echo "HTTP/1.1 200 OK"
+                  echo "Content-Type: application/json" 
+                  echo "Content-Length: ${#response}"
+                  echo ""
+                  echo "$response"
+                  ;;
+                *)
+                  # 默认响应
+                  response="Consumer is running on $HOSTNAME"
+                  echo "HTTP/1.1 200 OK"
+                  echo "Content-Type: text/plain"
+                  echo "Content-Length: ${#response}"
+                  echo ""
+                  echo "$response"
+                  ;;
+              esac
+            ) &
+            
+            # 监听端口8080
+            nc -l -p 8080 < /tmp/http_pipe | (
+              while IFS= read -r line; do
+                echo "$line" > /tmp/http_pipe
+              done
+            )
+          done
+          EOF
+          
+          chmod +x /tmp/consumer-server.sh
+          /tmp/consumer-server.sh
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-consumer-fixed-service
+  namespace: dapr-demo
+spec:
+  selector:
+    app: test-consumer-fixed
+  ports:
+  - port: 8080
+    targetPort: 8080 

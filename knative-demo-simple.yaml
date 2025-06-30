@@ -1,0 +1,218 @@
+# Knative 事件驱动架构演示
+# 架构：Producer → Broker → Trigger → Consumer
+
+---
+# 1. 命名空间
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: knative-demo
+
+---
+# 2. Broker - 事件中心
+apiVersion: eventing.knative.dev/v1
+kind: Broker
+metadata:
+  name: default
+  namespace: knative-demo
+  annotations:
+    eventing.knative.dev/broker.class: MTChannelBasedBroker
+spec:
+  # 可选：配置 Kafka 后端
+  # config:
+  #   apiVersion: v1
+  #   kind: ConfigMap
+  #   name: kafka-broker-config
+  #   namespace: knative-eventing
+
+---
+# 3. 事件生产者
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-producer
+  namespace: knative-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: producer
+  template:
+    metadata:
+      labels:
+        app: producer
+    spec:
+      containers:
+      - name: producer
+        image: python:3.11-slim
+        env:
+        - name: BROKER_URL
+          value: "http://broker-ingress.knative-eventing.svc.cluster.local/knative-demo/default"
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          pip install requests > /dev/null 2>&1
+          python3 -c "
+          import requests, json, time, uuid
+          from datetime import datetime
+          
+          broker_url = '$BROKER_URL'
+          event_types = ['user.created', 'order.placed', 'payment.processed']
+          
+          while True:
+              event_type = event_types[int(time.time()) % len(event_types)]
+              event = {
+                  'specversion': '1.0',
+                  'type': event_type,
+                  'source': 'demo-producer',
+                  'id': str(uuid.uuid4()),
+                  'time': datetime.utcnow().isoformat() + 'Z',
+                  'data': {'message': f'Hello from {event_type}', 'timestamp': time.time()}
+              }
+              
+              headers = {'Content-Type': 'application/json', 'Ce-Specversion': '1.0',
+                        'Ce-Type': event_type, 'Ce-Source': 'demo-producer', 'Ce-Id': event['id']}
+              
+              try:
+                  response = requests.post(broker_url, json=event['data'], headers=headers)
+                  print(f'✅ Sent {event_type}: {response.status_code}')
+              except Exception as e:
+                  print(f'❌ Error: {e}')
+              
+              time.sleep(5)
+          "
+
+---
+# 4. 事件消费者
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-consumer
+  namespace: knative-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: consumer
+  template:
+    metadata:
+      labels:
+        app: consumer
+    spec:
+      containers:
+      - name: consumer
+        image: python:3.11-slim
+        ports:
+        - containerPort: 8080
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          pip install flask > /dev/null 2>&1
+          python3 -c "
+          from flask import Flask, request, jsonify
+          import json, time
+          
+          app = Flask(__name__)
+          processed_count = 0
+          
+          @app.route('/', methods=['POST'])
+          def handle_event():
+              global processed_count
+              processed_count += 1
+              
+              # 获取 CloudEvents 头部
+              event_type = request.headers.get('Ce-Type', 'unknown')
+              event_source = request.headers.get('Ce-Source', 'unknown')
+              event_id = request.headers.get('Ce-Id', 'unknown')
+              
+              # 获取事件数据
+              data = request.get_json() or {}
+              
+              print(f'🎯 [{processed_count}] Received {event_type} from {event_source}')
+              print(f'   Event ID: {event_id}')
+              print(f'   Data: {data}')
+              
+              # 模拟处理时间
+              time.sleep(0.1)
+              
+              return jsonify({'status': 'processed', 'event_id': event_id}), 200
+          
+          @app.route('/health', methods=['GET'])
+          def health():
+              return jsonify({'status': 'healthy', 'processed': processed_count})
+          
+          print('🚀 Consumer started on port 8080')
+          app.run(host='0.0.0.0', port=8080)
+          "
+
+---
+# 5. 消费者服务
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-consumer-service
+  namespace: knative-demo
+spec:
+  selector:
+    app: consumer
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# 6. Trigger - 事件路由规则
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: user-events-trigger
+  namespace: knative-demo
+spec:
+  broker: default
+  filter:
+    attributes:
+      type: user.created
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: event-consumer-service
+    uri: /
+
+---
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: order-events-trigger
+  namespace: knative-demo
+spec:
+  broker: default
+  filter:
+    attributes:
+      type: order.placed
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: event-consumer-service
+    uri: /
+
+---
+apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: payment-events-trigger
+  namespace: knative-demo
+spec:
+  broker: default
+  filter:
+    attributes:
+      type: payment.processed
+  subscriber:
+    ref:
+      apiVersion: v1
+      kind: Service
+      name: event-consumer-service
+    uri: / 

@@ -1,0 +1,34 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  # 基础连接配置 - 请根据您的Redis实际信息修改
+  - name: redisHost
+    value: "172.22.131.59:6379"  # 替换为您的Redis服务名和端口
+  - name: redisPassword
+    value: ""  # 如果有密码，请在这里设置或使用Secret
+  - name: redisDB
+    value: "2"  # Redis数据库号，默认0
+    
+  # 性能优化配置
+  - name: enableTLS
+    value: "false"  # 如果Redis启用了TLS，设置为true
+  - name: maxRetries
+    value: "3"
+  - name: maxRetryBackoff
+    value: "2s"
+  - name: failover
+    value: "false"  # 如果是Redis Sentinel模式，设置为true
+    
+  # Pub/Sub特定配置
+  - name: concurrency
+    value: "10"  # 并发消费者数量
+  - name: processingTimeout
+    value: "15s"  # 消息处理超时时间
+  - name: redeliverInterval
+    value: "60s"  # 消息重投递间隔 

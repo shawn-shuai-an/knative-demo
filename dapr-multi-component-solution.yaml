@@ -1,0 +1,106 @@
+# 解决方案1：为每种消息类型创建独立的 Component
+# 实现真正的并发隔离
+
+---
+# Pod 事件专用 Component (高频，轻量级)
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pod-events-pubsub
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: "172.22.131.59:6379"
+  - name: redisDB
+    value: "2"                    # 专用DB
+  
+  # 高频消息的优化配置
+  - name: concurrency
+    value: "50"                   # 高并发处理能力
+  - name: processingTimeout
+    value: "5s"                   # 短超时，快速失败
+  - name: maxRetries
+    value: "2"                    # 少重试
+  - name: enableDeadLetter
+    value: "true"
+  - name: deadLetterTopic
+    value: "pod-events-deadletter"
+
+---
+# Deployment 事件专用 Component (中频，重处理)
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: deployment-events-pubsub
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: "172.22.131.59:6379"
+  - name: redisDB
+    value: "3"                    # 独立DB
+  
+  # 中频消息的平衡配置
+  - name: concurrency
+    value: "20"                   # 中等并发
+  - name: processingTimeout
+    value: "30s"                  # 中等超时
+  - name: maxRetries
+    value: "5"                    # 中等重试
+  - name: enableDeadLetter
+    value: "true"
+  - name: deadLetterTopic
+    value: "deployment-events-deadletter"
+
+---
+# Service 事件专用 Component (低频，复杂处理)
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: service-events-pubsub
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: "172.22.131.59:6379"
+  - name: redisDB
+    value: "4"                    # 独立DB
+  
+  # 低频消息的重处理配置
+  - name: concurrency
+    value: "10"                   # 低并发，避免资源竞争
+  - name: processingTimeout
+    value: "120s"                 # 长超时，支持复杂处理
+  - name: maxRetries
+    value: "10"                   # 多重试，重要数据
+  - name: enableDeadLetter
+    value: "true"
+  - name: deadLetterTopic
+    value: "service-events-deadletter"
+
+---
+# 可选：全局监控 Component (用于跨类型分析)
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: global-monitoring-pubsub
+  namespace: dapr-demo
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+  - name: redisHost
+    value: "172.22.131.59:6379"
+  - name: redisDB
+    value: "5"                    # 监控专用DB
+  - name: concurrency
+    value: "5"                    # 低并发，监控用途
+  - name: processingTimeout
+    value: "60s" 
